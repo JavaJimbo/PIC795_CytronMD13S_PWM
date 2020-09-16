@@ -13,6 +13,9 @@
  *          also four encoder counters and encoder direction inputs.
  *          Created USE_PID mode and tested PID with one motor.
  *          Fixed a few PID bugs - works better, and doesn't overrun and go wild.
+ *          Added previousPosition, quadCurrent, quadPrevious to PIDtype struct.
+ *          Enabled PID for all five motors.
+ * 9-16-20: 
  ***********************************************************************************/
 #define USE_PID
 #define SUCCESS 0
@@ -36,7 +39,7 @@
 #define	ETX '\r'
 
 #define MAXSERVOS 64  // Was 256
-#define NUMMOTORS 1
+#define NUMMOTORS 5
 
 #define FORWARD 0
 #define REVERSE 1
@@ -110,14 +113,11 @@ enum {
 #define EncoderThreeDir PORTEbits.RE7
 #define EncoderFourDir PORTEbits.RE8
 
-
-
 #define MOTOR_DIR1 LATGbits.LATG12
 #define MOTOR_DIR2 LATDbits.LATD13
 #define MOTOR_DIR3 LATDbits.LATD11
 #define MOTOR_DIR4 LATAbits.LATA5
 #define MOTOR_DIR5 LATDbits.LATD10
-
 
 #define EEPROM_WRITE_PROTECT LATDbits.LATD8
 #define LED LATDbits.LATD9
@@ -139,7 +139,6 @@ enum {
 #define RS485uart UART5
 #define RS485bits U5STAbits
 #define RS485_VECTOR _UART_5_VECTOR
-
 
 #define CR 13
 #define LF 10
@@ -167,6 +166,9 @@ struct PIDtype
     short ErrorCounter;
     unsigned char saturation;
     unsigned char reset;    
+    short previousPosition;
+    unsigned short quadCurrent;
+    unsigned short quadPrevious;         
 } PID[NUMMOTORS];
 
 
@@ -242,6 +244,7 @@ unsigned char SWChangeFlag = false;
 unsigned char intFlag = false;
 unsigned char memoryFlag = false;
 unsigned char runMode = HALTED;
+short errIndex = 0;
 
 int main(void) 
 {
@@ -264,11 +267,11 @@ int main(void)
     
     InitializeSystem();      
     MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 1;
-    PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;    
+    PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
     RS485_ENABLE = 0;    
 
 #ifdef USE_PID
-    printf("\r\rTesting SERVOS.\r");    
+    printf("\r\rTesting %d SERVOS.\r", NUMMOTORS);    
     if (runMode==LOCAL) printf("RunMode = LOCAL");
     else if (runMode==REMOTE) printf("RunMode = REMOTE");
     else if (runMode==JOG) printf("RunMode = JOG");
@@ -294,7 +297,6 @@ int main(void)
     
     while(1) 
     {   
-        DelayMs(1);       
         if (SWChangeFlag)
         {
             SWChangeFlag = false;
@@ -307,9 +309,7 @@ int main(void)
             else printf("SW3 LOW, ");    
             if (SWRead & 0b1000) printf("SW4 HI");
             else printf("SW4 LOW");                 
-        }
-        
-        if (!runMode) PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;        
+        }        
         
         if (RS485RxBufferFull)
         {
@@ -347,9 +347,7 @@ int main(void)
         if (intFlag)
         {
             intFlag = false;
-            if (TEST_OUT) TEST_OUT = 0;
-            else TEST_OUT = 1;
-            
+            TEST_OUT = 1;
             IFS1bits.AD1IF = 0;
             while(!IFS1bits.AD1IF);        
             AD1CON1bits.ASAM = 0;        // Pause sampling. 
@@ -368,9 +366,7 @@ int main(void)
                     PID[i].ADActual = (short)(ADresult[i+1]);                    
                     
                     if (runMode == JOG) 
-                    {
                         PWMvalue = JogPWM;
-                    }
                     else
                     {
                         PIDcontrol(i, PID);                                    
@@ -407,7 +403,7 @@ int main(void)
                         else MOTOR_DIR3 = FORWARD;                            
                         PWM3 = 0; // PWMvalue;
                     }
-                    else
+                    else if (i == 3)
                     {
                         if (PWMvalue < 0)
                         {            
@@ -417,15 +413,28 @@ int main(void)
                         else MOTOR_DIR4 = FORWARD;                            
                         PWM4 = 0; // PWMvalue;                            
                     }
+                    else
+                    {
+                        if (PWMvalue < 0)
+                        {            
+                            MOTOR_DIR5 = REVERSE;                    
+                            PWMvalue = 0 - PWMvalue;
+                        }
+                        else MOTOR_DIR5 = FORWARD;                            
+                        PWM5 = 0; // PWMvalue;                            
+                    }
                     
-                }
+                }                                                
+                errIndex++; 
+                if (errIndex >= FILTERSIZE) errIndex = 0;
             }
             else
             {
-                PID[0].sumError = 0;
-                PWM1 = PWM2 = PWM3 = PWM4 = 0;
+                for (i = 0; i < NUMMOTORS; i++) PID[i].sumError = 0;
+                PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
                 LED = 0;
-            }            
+            }    
+            TEST_OUT = 0;
         }    
 #endif        
         
@@ -650,8 +659,12 @@ void ResetPID()
         PID[i].reset = true;
         PID[i].saturation = false;
         PID[i].ErrorCounter = 0;
+        PID[i].previousPosition = 0;
+        PID[i].quadCurrent = QUAD_NONE;
+        PID[i].quadPrevious = QUAD_NONE;              
         for (j = 0; j < FILTERSIZE; j++) PID[i].error[j] = 0;
     }
+    errIndex = 0;
 }
 
 void PrintServoData(short numServos, short *ptrServoPositions, unsigned char command, unsigned char subCommand)
@@ -887,7 +900,7 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void)
     }
     
     intCounter++;
-    if (intCounter >= 50) // 50
+    if (intCounter >= 80) // 50
     {
         intCounter = 0;
         intFlag = true;
@@ -1135,50 +1148,31 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void)
 long PIDcontrol(long servoID, struct PIDtype *PID)
 {
     short Error;     
-    static short previousPosition = 0;
     short actualPosition;
     short commandPosition; 
-    short pastError;
     long totalDerError = 0;
-    long derError;
-    static short errIndex = 0;
+    long derError;    
     float PCorr = 0, ICorr = 0, DCorr = 0;    
-    static short displayCounter = 0;
-    static unsigned short quadCurrent = QUAD_NONE;
-    static unsigned short quadPrevious = QUAD_NONE;       
     unsigned char sensorError = false;
-    //unsigned char errorFlag = false;
-    //static unsigned char PosDirection = 0, PreviousDirection = 0;
     short i;
-       
-    if (servoID != 0) return 0;  
+    static short displayCounter = 0;               
     
-    if (PID[servoID].ADActual < 341) quadCurrent = QUAD_ONE;
-    else if (PID[servoID].ADActual < 682) quadCurrent = QUAD_TWO;
-    else quadCurrent = QUAD_THREE;
+    if (PID[servoID].ADActual < 341) PID[servoID].quadCurrent = QUAD_ONE;
+    else if (PID[servoID].ADActual < 682) PID[servoID].quadCurrent = QUAD_TWO;
+    else PID[servoID].quadCurrent = QUAD_THREE;
     
-    if (quadCurrent==QUAD_THREE && (quadPrevious==QUAD_ONE || previousPosition < 0))
-    {
+    if (PID[servoID].quadCurrent==QUAD_THREE && (PID[servoID].quadPrevious==QUAD_ONE || PID[servoID].previousPosition < 0))
         actualPosition = PID[servoID].ADActual - 1024;
-        // printf("\rOVERSHOOT NEG: %ld", actualPosition);
-        //errorFlag = true;
-    }    
-    else if (quadCurrent==QUAD_ONE && (quadPrevious==QUAD_THREE || previousPosition > 1023))
-    {
+    else if (PID[servoID].quadCurrent==QUAD_ONE && (PID[servoID].quadPrevious==QUAD_THREE || PID[servoID].previousPosition > 1023))
         actualPosition = PID[servoID].ADActual + 1024;
-        // printf("\rOVERSHOOT POS: %ld", actualPosition);
-        //errorFlag = true;
-    }
     else actualPosition = PID[servoID].ADActual;
     
-    quadPrevious = quadCurrent;
-    previousPosition = actualPosition; 
+    PID[servoID].quadPrevious = PID[servoID].quadCurrent;
+    PID[servoID].previousPosition = actualPosition; 
     
     commandPosition = PID[servoID].ADCommand;
     Error = actualPosition - commandPosition;    
     PID[servoID].error[errIndex] = Error;
-    errIndex++; 
-    if (errIndex >= FILTERSIZE) errIndex = 0;                                  
          
     if (!PID[servoID].saturation) PID[servoID].sumError = PID[servoID].sumError + (long)Error; 
         
@@ -1229,11 +1223,6 @@ long PIDcontrol(long servoID, struct PIDtype *PID)
         PID[servoID].sumError = 0;        
         sensorError = true;
     }    
-    
-    //if (PID[servoID].PWMvalue > 0) PosDirection = 0;
-    //else PosDirection = 1;
-    //if (PreviousDirection != PosDirection) errorFlag = true;
-    //PreviousDirection = PosDirection;
     
     if (servoID == 0 && displayFlag)
     {
