@@ -15,10 +15,19 @@
  *          Fixed a few PID bugs - works better, and doesn't overrun and go wild.
  *          Added previousPosition, quadCurrent, quadPrevious to PIDtype struct.
  *          Enabled PID for all five motors.
- * 9-16-20: 
+ * 9-16-20: Got DMA working with RS485 Rx at 981600 baud.
+ * 9-20-20: Got RC Feather servo board working.
+ * 9-21-20: 
+ * 9-22-20: Got encoders working nicely in Destination mode - enter positions by text.
+ * 9-23-20: Eliminated Velocity mode for now.
  ***********************************************************************************/
 #define USE_PID
 #define SUCCESS 0
+
+enum {
+    POT_MODE = 0,
+    ENCODER_MODE    
+};
 
 #define	STX '>'
 #define	DLE '/'
@@ -26,13 +35,18 @@
 
 #define MAXPOTS 10
 // For 26:1 motors
-#define PWM_OFFSET 0 // Was 220
+#define PWM_OFFSET 0 
 #define KP 8.0
 #define KI 0.01
 #define KD 10.0 
+
+#define KK_PWM_OFFSET 100
+#define KKP 8.0
+#define KKI 0.04
+#define KKD 30.0 
+
 #define MAX_COMMAND_COUNTS 850
 #define MIN_COMMAND_COUNTS 100
-
 
 #define	STX '>'
 #define	DLE '/'
@@ -44,10 +58,9 @@
 #define FORWARD 0
 #define REVERSE 1
 #define MAXSUM 500000
-#define PWM_MAX 2000
+#define PWM_MAX 2000  // 4000
 
 #define FILTERSIZE 4
-
 
 #include <xc.h>
 #include "Delay.h"
@@ -88,7 +101,8 @@
 #define false FALSE
 #define true TRUE
 
-enum {
+enum 
+{
     HALTED=0,
     LOCAL,
     JOG,
@@ -137,8 +151,12 @@ enum {
 #define XBEE_VECTOR _UART_4_VECTOR
 
 #define RS485uart UART5
+#define RS485_RxReg U5RXREG
+#define RS485_TxReg U5TXREG
 #define RS485bits U5STAbits
 #define RS485_VECTOR _UART_5_VECTOR
+#define RS485_RX_IRQ _UART5_RX_IRQ
+#define RS485_TX_IRQ _UART5_TX_IRQ
 
 #define CR 13
 #define LF 10
@@ -154,7 +172,7 @@ enum {
 
 struct PIDtype
 {
-    short error[FILTERSIZE];
+    long  error[FILTERSIZE];
     long  sumError;    
     float kP;
     float kI;
@@ -162,24 +180,31 @@ struct PIDtype
     short PWMoffset;
     short PWMvalue;
     short ADActual;
+    long  CommandPos;
+    long  ActualPos;
+    float CommandVelocity;    
+    long  Time;
     short ADCommand;
     short ErrorCounter;
     unsigned char saturation;
-    unsigned char reset;    
+    unsigned char reset;
     short previousPosition;
     unsigned short quadCurrent;
-    unsigned short quadPrevious;         
+    unsigned short quadPrevious;
+    unsigned Mode;    
+    unsigned char Halted;
 } PID[NUMMOTORS];
 
 
 /** V A R I A B L E S ********************************************************/
+unsigned char DMATxTestFlag = false;
 unsigned short offSet;
 unsigned char NUMbuffer[MAXNUM + 1];
 unsigned char HOSTRxBuffer[MAXBUFFER+1];
 unsigned char HOSTRxBufferFull = false;
 unsigned char HOSTTxBuffer[MAXBUFFER+1]; 
 unsigned char MEMORYBuffer[MAXBUFFER+1]; 
-unsigned char displayFlag = false;
+unsigned char displayFlag = true;
 
 unsigned char XBEERxBuffer[MAXBUFFER+1];
 unsigned char XBEERxBufferFull = false;
@@ -187,17 +212,20 @@ long ActualXBEEBaudRate;
 
 unsigned char RS485RxBufferFull = false;
 unsigned char RS485TxBufferFull = false;
+unsigned char RS485_DMA_RxBuffer[MAXBUFFER+1];
+// unsigned char RS485_DMA_TxBuffer[MAXBUFFER+1] = "This is not a test.\r";
 unsigned char RS485RxBuffer[MAXBUFFER+1];
-unsigned char RS485RxBufferCopy[MAXBUFFER+1];
+unsigned char RS485TxBuffer[MAXBUFFER+1] = "\rThis has got to be the one";
+int RS485TxIndex = 0;
+int RS485TxLength = 0;
 unsigned char ServoData[MAXBUFFER+1];
 short servoPositions[MAXSERVOS];
 long ActualRS485BaudRate = 0;
 int timeout = 0;
 
 /** P R I V A T E  P R O T O T Y P E S ***************************************/
-void setMotorOne(short TargetDutyCycle);
-void setMotorTwo(short TargetDutyCycle);
-
+void SetupDMA_Rx(void);
+int StartRS485Tx(void);
 int ADC10_ManualInit(void);
 static void InitializeSystem(void);
 void YourHighPriorityISRCode();
@@ -212,10 +240,12 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
 unsigned char processPacketData(short packetDataLength, unsigned char *ptrPacketData, short *numServos, short *ptrServoPositions, unsigned char *command, unsigned char *subCommand);
 unsigned char SendReceiveSPI(unsigned char dataOut);
 void ResetPID();
-long PIDcontrol(long servoID, struct PIDtype *PID);
+void InitPID();
+long POTcontrol(long servoID, struct PIDtype *PID);
+long ENCODERcontrol(long servoID, struct PIDtype *PID);
 
 unsigned char DATABufferFull = false;
-void ClearCopyBuffer();
+// void ClearCopyBuffer();
 void makeFloatString(float InValue, int numDecimalPlaces, unsigned char *arrAscii);
 
 enum
@@ -243,8 +273,10 @@ unsigned short SWRead = 0;
 unsigned char SWChangeFlag = false;
 unsigned char intFlag = false;
 unsigned char memoryFlag = false;
-unsigned char runMode = HALTED;
+unsigned char runState = HALTED;
 short errIndex = 0;
+
+#define PCA9685_ADDRESS 0x80 // Basic default address for Adafruit Feather Servo Board
 
 int main(void) 
 {
@@ -259,28 +291,32 @@ int main(void)
     unsigned char MessageIn[64] = "";
     unsigned ADdisplay = true;    
     short SWcounter = 0;    
-    unsigned char previousRunMode = LOCAL;
+    unsigned char runMode = LOCAL;
     short startAddress = 0x0000;
+    #define NUM_RC_SERVOS 8
+    short RCservoPos[NUM_RC_SERVOS];
+    short DisplayCounter = 0;
+    short testCounter = 0;
+    short MotorFour;
+    short ENCdisplayCounter = 0;    
+    long Destination = 30;    
     
-    ResetPID();      
+    InitPID();     
     DelayMs(10);
     
     InitializeSystem();      
-    MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 1;
-    PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
-    RS485_ENABLE = 0;    
 
 #ifdef USE_PID
-    printf("\r\rTesting %d SERVOS.\r", NUMMOTORS);    
-    if (runMode==LOCAL) printf("RunMode = LOCAL");
-    else if (runMode==REMOTE) printf("RunMode = REMOTE");
-    else if (runMode==JOG) printf("RunMode = JOG");
+    printf("\r\rTesting Constant Velocity mode...\r");    
+    if (runState==LOCAL) printf("RunMode = LOCAL");
+    else if (runState==REMOTE) printf("RunMode = REMOTE");
+    else if (runState==JOG) printf("RunMode = JOG");
     else printf("RunMode = STANDBY");
 #else
     printf("\r\rSERVOS Disabled\r");    
-    if (runMode==LOCAL) printf("RunMode = LOCAL");
-    else if (runMode==REMOTE) printf("RunMode = REMOTE");
-    else if (runMode==JOG) printf("RunMode = JOG");
+    if (runState==LOCAL) printf("RunMode = LOCAL");
+    else if (runState==REMOTE) printf("RunMode = REMOTE");
+    else if (runState==JOG) printf("RunMode = JOG");
     else printf("RunMode = STANDBY");    
     
     DelayMs(10);
@@ -295,6 +331,7 @@ int main(void)
     printf("\rMessage: %s", MessageIn);
 #endif
     
+    printf("\rTesting DMA Rx and Tx on RS485");
     while(1) 
     {   
         if (SWChangeFlag)
@@ -311,23 +348,16 @@ int main(void)
             else printf("SW4 LOW");                 
         }        
         
+        
         if (RS485RxBufferFull)
         {
             RS485RxBufferFull = false;
-            RS485_ENABLE = 1;
-            DelayMs(10);
-            while(!UARTTransmitterIsReady(RS485uart));
-            UARTSendDataByte (RS485uart, '>');
-            length = strlen(RS485RxBuffer);
-            for (i = 0; i < length; i++)
-            {
-                ch = RS485RxBuffer[i];
-                while(!UARTTransmitterIsReady(RS485uart));
-                UARTSendDataByte (RS485uart, ch);
-            }
-            DelayMs(10);
-            RS485_ENABLE = 0;
+            printf("\rReceived RS485: %s", RS485RxBuffer);
+            strcpy(RS485TxBuffer, "\rReceived: ");
+            strcat(RS485TxBuffer, RS485RxBuffer);
+            StartRS485Tx();
         }
+        
         
         if (XBEERxBufferFull)
         {
@@ -353,24 +383,25 @@ int main(void)
             AD1CON1bits.ASAM = 0;        // Pause sampling. 
             for (i = 0; i < MAXPOTS; i++)
                 ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
-            AD1CON1bits.ASAM = 1;        // Restart sampling.                         
-
-            if (runMode)
+            AD1CON1bits.ASAM = 1;        // Restart sampling.                                 
+            
+            if (runState)
             {               
                 mAD1IntEnable(INT_ENABLED);
                 for (i = 0; i < NUMMOTORS; i++)
-                {                            
-                    PID[i].ADCommand = (short)(ADresult[i+6]);
-                    if (PID[i].ADCommand > MAX_COMMAND_COUNTS) PID[i].ADCommand = MAX_COMMAND_COUNTS; 
-                    if (PID[i].ADCommand < MIN_COMMAND_COUNTS) PID[i].ADCommand = MIN_COMMAND_COUNTS; 
-                    PID[i].ADActual = (short)(ADresult[i+1]);                    
-                    
-                    if (runMode == JOG) 
-                        PWMvalue = JogPWM;
+                {                             
+                    if (runState == JOG) 
+                        PWMvalue = JogPWM = 0;
                     else
-                    {
-                        PIDcontrol(i, PID);                                    
-                        PWMvalue = PID[i].PWMvalue;            
+                    {                                                     
+                        if (!PID[i].Halted)
+                        {
+                            if (PID[i].Mode == POT_MODE) 
+                                POTcontrol(i, PID);
+                            else ENCODERcontrol(i, PID);                        
+                            PWMvalue = PID[i].PWMvalue;
+                        }
+                        else PWMvalue = 0;
                     }
                     if (i == 0) 
                     {
@@ -380,7 +411,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;                            
                         }
                         else MOTOR_DIR1 = FORWARD;                                    
-                        PWM1 = PWMvalue;                            
+                        PWM1 = PWMvalue;
                         
                     }       
                     else if (i == 1)
@@ -391,7 +422,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR2 = FORWARD;
-                        PWM2 = 0; // PWMvalue;                            
+                        PWM2 = PWMvalue;
                     }                                                
                     else if (i == 2) 
                     {
@@ -401,17 +432,17 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR3 = FORWARD;                            
-                        PWM3 = 0; // PWMvalue;
+                        PWM3 = PWMvalue;
                     }
-                    else if (i == 3)
+                    else if (i == 3)  // Motor #4
                     {
                         if (PWMvalue < 0)
                         {            
                             MOTOR_DIR4 = REVERSE;                    
                             PWMvalue = 0 - PWMvalue;
                         }
-                        else MOTOR_DIR4 = FORWARD;                            
-                        PWM4 = 0; // PWMvalue;                            
+                        else MOTOR_DIR4 = FORWARD;          
+                        PWM4 = PWMvalue;
                     }
                     else
                     {
@@ -421,19 +452,19 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR5 = FORWARD;                            
-                        PWM5 = 0; // PWMvalue;                            
+                        PWM5 = PWMvalue;
                     }
                     
                 }                                                
                 errIndex++; 
                 if (errIndex >= FILTERSIZE) errIndex = 0;
             }
-            else
+            else            
             {
                 for (i = 0; i < NUMMOTORS; i++) PID[i].sumError = 0;
                 PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
                 LED = 0;
-            }    
+            }   
             TEST_OUT = 0;
         }    
 #endif        
@@ -467,14 +498,14 @@ int main(void)
                 switch (command) 
                 {
                     case 'F':
-                        if (!runMode)
+                        if (!runState)
                         {
                             MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 1;
                             printf("\rFORWARD");
                         }
                         break;
                     case 'R':
-                        if (!runMode)
+                        if (!runState)
                         {                        
                             MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 0;
                             printf("\rREVERSE");
@@ -503,23 +534,29 @@ int main(void)
                     case 'J':
                         JogPWM = (long) floValue;
                         printf("\rJOG ON: %d", JogPWM);
-                        runMode = JOG;                        
+                        runState = JOG;                        
                         break;                        
                     case ' ':
-                        if (runMode) 
+                        ResetPID();
+                        if (runState) 
                         {                            
-                            previousRunMode = runMode;
-                            runMode = HALTED; 
+                            runState = STANDBY; 
                             printf("\rHALT");
                         }
                         else
                         {
-                            runMode = previousRunMode;
-                            if (runMode==LOCAL) printf("RunMode = LOCAL");
-                            else if (runMode==REMOTE) printf("RunMode = REMOTE");
-                            else if (runMode==JOG) printf("RunMode = JOG");
-                            else printf("RunMode = STANDBY");
-                        } 
+                            runState = runMode;
+                            if (runState==LOCAL) printf("Run State = LOCAL");
+                            else if (runState==REMOTE) printf("Run State = REMOTE");
+                            else if (runState==JOG) printf("Run State = JOG");
+                            else printf("ERROR RunMode = %d", runMode);
+                            ENCdisplayCounter = 0;
+                            PID[0].Halted = false;
+                            PID[0].Mode = POT_MODE;
+                            PID[3].Halted = false;
+                            PID[3].Mode = ENCODER_MODE;
+                            PID[3].CommandPos = Destination;
+                        }                         
                         break;
                     case 'M':
                         if (displayFlag)
@@ -533,8 +570,8 @@ int main(void)
                         }   
                         break;
                     case 'Z':
-                        ResetPID();
-                        printf("\rPID reset = true");
+                        Destination = (long)floValue;
+                        printf("\rDestination = %ld", Destination);
                         break;
                     case 'T':
                         if (ADdisplay)
@@ -555,6 +592,7 @@ int main(void)
                 } // end switch command                
                 printf("\rkP = %0.1f, kI = %0.3f, kD = %0.1f, Offset: %d\r", PID[0].kP, PID[0].kI, PID[0].kD, PID[0].PWMoffset);
                 CONTINUE1: continue;
+                command = 0;
             } // End if command             
         } // End if HOSTRxBufferFull        
     } // End while(1))
@@ -605,21 +643,17 @@ unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData)
     return (j);
 }
 
-
-
-
-
-
+/*
 void ClearCopyBuffer()
 {
     int i;
     for (i = 0; i < MAXBUFFER; i++)
     {
-        RS485RxBufferCopy[i] = '\0';
-        // RS485RxBuffer[i] = '\0';
+        RS485RxBuffer[i] = '\0';
+        // RS485_DMA_RxBuffer[i] = '\0';
     }
 }
-
+*/
 
 unsigned char processPacketData(short packetDataLength, unsigned char *ptrPacketData, short *numServos, short *ptrServoPositions, unsigned char *command, unsigned char *subCommand)
 {
@@ -643,30 +677,6 @@ unsigned char processPacketData(short packetDataLength, unsigned char *ptrPacket
     return true;
 }
 
-void ResetPID()
-{
-    int i, j;
-    for (i = 0; i < NUMMOTORS; i++)
-    {
-        PID[i].sumError = 0; // For 53:1 ratio Servo City motor
-        PID[i].kP = KP;
-        PID[i].kI = KI;
-        PID[i].kD = KD;
-        PID[i].PWMoffset = PWM_OFFSET;
-        PID[i].PWMvalue = 0;
-        PID[i].ADActual = 0;
-        PID[i].ADCommand = 0;
-        PID[i].reset = true;
-        PID[i].saturation = false;
-        PID[i].ErrorCounter = 0;
-        PID[i].previousPosition = 0;
-        PID[i].quadCurrent = QUAD_NONE;
-        PID[i].quadPrevious = QUAD_NONE;              
-        for (j = 0; j < FILTERSIZE; j++) PID[i].error[j] = 0;
-    }
-    errIndex = 0;
-}
-
 void PrintServoData(short numServos, short *ptrServoPositions, unsigned char command, unsigned char subCommand)
 {
     int i;
@@ -674,225 +684,17 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
     for (i = 0; i < 10; i++) printf("%d, ", ptrServoPositions[i]);
 }
 
-
-// RS485 UART interrupt handler it is set at priority level 2
-void __ISR(RS485_VECTOR, ipl2) IntRS485UartHandler(void) 
-{
-    unsigned char ch;
-    static unsigned short RS485RxIndex = 0;
-
-    if (RS485bits.OERR || RS485bits.FERR) {
-        if (UARTReceivedDataIsAvailable(RS485uart))
-            ch = UARTGetDataByte(RS485uart);
-        RS485bits.OERR = 0;
-        RS485RxIndex = 0;
-    } else if (INTGetFlag(INT_SOURCE_UART_RX(RS485uart))) {
-        INTClearFlag(INT_SOURCE_UART_RX(RS485uart));
-        if (UARTReceivedDataIsAvailable(RS485uart)) {
-            ch = UARTGetDataByte(RS485uart);
-            {
-                if (ch == LF || ch == 0);
-                else if (ch == CR) 
-                {
-                    if (RS485RxIndex < (MAXBUFFER-1)) 
-                    {
-                        RS485RxBuffer[RS485RxIndex] = CR;
-                        RS485RxBuffer[RS485RxIndex + 1] = '\0'; 
-                        RS485RxBufferFull = true;
-                    }
-                    RS485RxIndex = 0;
-                }                
-                else 
-                {
-                    if (RS485RxIndex < (MAXBUFFER-1))
-                        RS485RxBuffer[RS485RxIndex++] = ch;                    
-                }
-            }
-        }
-    }
-    if (INTGetFlag(INT_SOURCE_UART_TX(RS485uart))) {
-        INTClearFlag(INT_SOURCE_UART_TX(RS485uart));
-    }
-}
-
-
-
-void InitializeSystem(void) 
-{
-	int i; 
-    
-    SYSTEMConfigPerformance(80000000);
-    
-    // Turn off JTAG so we get the pins back
-    mJTAGPortEnable(false);
-    
-    ADC10_ManualInit();
-    
-    // I/O Ports:
-    PORTSetPinsDigitalOut(IOPORT_A, BIT_5);  // MOTOR_DIR4 
-    PORTSetPinsDigitalIn(IOPORT_B, BIT_0 | BIT_1 | BIT_2);  // SW1-3
-    PORTSetPinsDigitalOut(IOPORT_B, BIT_5);  // RS485_ENABLE
-    PORTSetPinsDigitalIn(IOPORT_C, BIT_13);  // SW4
-    PORTSetPinsDigitalOut(IOPORT_C, BIT_1);  // TEST_OUT
-    PORTSetPinsDigitalIn(IOPORT_D, BIT_7);  // SW5
-    PORTSetPinsDigitalOut(IOPORT_D, BIT_8 | BIT_9 | BIT_10 | BIT_11 | BIT_13);  // EE_WR, LED, MOTOR DIR #5, #3, #2
-    PORTSetPinsDigitalIn(IOPORT_E, BIT_9 | BIT_5 | BIT_7 | BIT_8);  // ENCODER DIRECTION INPUTS 1-4
-    PORTSetPinsDigitalOut(IOPORT_G, BIT_12);  // MOTOR DIR #1       
-    
-    mCNOpen(CN_ON, CN1_ENABLE | CN2_ENABLE | CN3_ENABLE | CN4_ENABLE, CN1_PULLUP_ENABLE | CN2_PULLUP_ENABLE | CN3_PULLUP_ENABLE | CN4_PULLUP_ENABLE);
-    ConfigIntCN(CHANGE_INT_ON | CHANGE_INT_PRI_2);    
-    
-    
-    // Set up timers as counters
-    T1CON = 0x00;
-    T1CONbits.TCS = 1; // Use external counter as input source (motor encoder)
-    T1CONbits.TCKPS1 = 0; // 1:1 Prescaler
-    T1CONbits.TCKPS0 = 0;
-    T1CONbits.TSYNC = 1;
-    PR1 = 0xFFFF;
-    T1CONbits.TON = 1; // Let her rip     
-
-    T3CON = 0x00;
-    T3CONbits.TCS = 1; // Use external counter as input source (motor encoder)
-    T3CONbits.TCKPS2 = 0; // 1:1 Prescaler
-    T3CONbits.TCKPS1 = 0;
-    T3CONbits.TCKPS0 = 0;
-    PR3 = 0xFFFF;
-    T3CONbits.TON = 1; // Let her rip 
-
-    T4CON = 0x00;
-    T4CONbits.TCS = 1; // Use external counter as input source (motor encoder)
-    T4CONbits.TCKPS2 = 0; // 1:1 Prescaler
-    T4CONbits.TCKPS1 = 0;
-    T4CONbits.TCKPS0 = 0;
-    T4CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
-    PR4 = 0xFFFF;
-    T4CONbits.TON = 1; // Let her rip 
-
-    T5CON = 0x00;
-    T5CONbits.TCS = 1; // Use external counter as input source (motor encoder)
-    T5CONbits.TCKPS2 = 0; // 1:1 Prescaler
-    T5CONbits.TCKPS1 = 0;
-    T5CONbits.TCKPS0 = 0;
-    PR5 = 0xFFFF;
-    T5CONbits.TON = 1; // Let her rip     
-    
-    // Set up Timer 2 for PWM time base    
-    T2CON = 0x00;
-    T2CONbits.TCKPS2 = 0; // 1:1 Prescaler
-    T2CONbits.TCKPS1 = 0;
-    T2CONbits.TCKPS0 = 0;    
-    PR2 = 4000; // Use 50 microsecond rollover for 20 khz
-    T2CONbits.TON = 1; // Let her rip   
-    ConfigIntTimer2(T2_INT_ON | T2_INT_PRIOR_2);                    
-
-    // Set up PWM OC1
-    OC1CON = 0x00;
-    OC1CONbits.OC32 = 0; // 16 bit PWM
-    OC1CONbits.ON = 1; // Turn on PWM
-    OC1CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
-    OC1CONbits.OCM2 = 1; // PWM runMode enabled, no fault pin
-    OC1CONbits.OCM1 = 1;
-    OC1CONbits.OCM0 = 0;
-    OC1RS = 0;
-
-    // Set up PWM OC2
-    OC2CON = 0x00;
-    OC2CONbits.OC32 = 0; // 16 bit PWM
-    OC2CONbits.ON = 1; // Turn on PWM
-    OC2CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
-    OC2CONbits.OCM2 = 1; // PWM runMode enabled, no fault pin
-    OC2CONbits.OCM1 = 1;
-    OC2CONbits.OCM0 = 0;
-    OC2RS = 0;
-
-    // Set up PWM OC3
-    OC3CON = 0x00;
-    OC3CONbits.OC32 = 0; // 16 bit PWM
-    OC3CONbits.ON = 1; // Turn on PWM
-    OC3CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
-    OC3CONbits.OCM2 = 1; // PWM runMode enabled, no fault pin
-    OC3CONbits.OCM1 = 1;
-    OC3CONbits.OCM0 = 0;
-    OC3RS = 0;
-
-    // Set up PWM OC4
-    OC4CON = 0x00;
-    OC4CONbits.OC32 = 0; // 16 bit PWM
-    OC4CONbits.ON = 1; // Turn on PWM
-    OC4CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
-    OC4CONbits.OCM2 = 1; // PWM runMode enabled, no fault pin
-    OC4CONbits.OCM1 = 1;
-    OC4CONbits.OCM0 = 0;
-    OC4RS = 0;
-    
-    // Set up PWM OC5
-    OC5CON = 0x00;
-    OC5CONbits.OC32 = 0; // 16 bit PWM
-    OC5CONbits.ON = 1; // Turn on PWM
-    OC5CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
-    OC5CONbits.OCM2 = 1; // PWM runMode enabled, no fault pin
-    OC5CONbits.OCM1 = 1;
-    OC5CONbits.OCM0 = 0;
-    OC5RS = 0;         
-    
-    // Set up HOST UART    
-    UARTConfigure(HOSTuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
-    UARTSetFifoMode(HOSTuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
-    UARTSetLineControl(HOSTuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    UARTSetDataRate(HOSTuart, SYS_FREQ, 57600);
-    UARTEnable(HOSTuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
-
-    // Configure HOST UART Interrupts
-    INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
-    INTEnable(INT_SOURCE_UART_RX(HOSTuart), INT_ENABLED);
-    INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
-    INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);    
-    
-    // Set up RS485 UART    
-    UARTConfigure(RS485uart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
-    UARTSetFifoMode(RS485uart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
-    UARTSetLineControl(RS485uart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    ActualRS485BaudRate = UARTSetDataRate(RS485uart, SYS_FREQ, 57600);
-    // ActualRS485BaudRate = UARTSetDataRate(RS485uart, SYS_FREQ, 2000000);
-    UARTEnable(RS485uart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
-
-    // Configure RS485 UART Interrupts
-    INTEnable(INT_SOURCE_UART_TX(RS485uart), INT_DISABLED);
-    INTEnable(INT_SOURCE_UART_RX(RS485uart), INT_ENABLED); 
-    INTSetVectorPriority(INT_VECTOR_UART(RS485uart), INT_PRIORITY_LEVEL_2);
-    INTSetVectorSubPriority(INT_VECTOR_UART(RS485uart), INT_SUB_PRIORITY_LEVEL_0);  
-    
- 
-    // Set up XBEE UART    
-    UARTConfigure(XBEEuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
-    UARTSetFifoMode(XBEEuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
-    UARTSetLineControl(XBEEuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 57600);
-    // ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 2000000);
-    UARTEnable(XBEEuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
-
-    // Configure XBEE UART Interrupts
-    INTEnable(INT_SOURCE_UART_TX(XBEEuart), INT_DISABLED);
-    INTEnable(INT_SOURCE_UART_RX(XBEEuart), INT_ENABLED); 
-    INTSetVectorPriority(INT_VECTOR_UART(XBEEuart), INT_PRIORITY_LEVEL_2);
-    INTSetVectorSubPriority(INT_VECTOR_UART(XBEEuart), INT_SUB_PRIORITY_LEVEL_0);        
-    
-    // Turn on the interrupts
-    INTEnableSystemMultiVectoredInt();   
-}//end UserInit
-
 // Timer 2 generates an interrupt every 50 microseconds approximately
 void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void) 
 {        
     static int intCounter = 0; 
-    static int LEDcounter = 2000;
+    static int LEDcounter = 10000;
     static int memoryCounter = 625; 
     
     mT2ClearIntFlag(); // clear the interrupt flag    
     
     LEDcounter++;
-    if (LEDcounter >= 2000)
+    if (LEDcounter >= 10000)
     {
         LEDcounter = 0;
         if (LED) LED = 0;
@@ -1145,7 +947,415 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void)
     mCNClearIntFlag();
 }
 
-long PIDcontrol(long servoID, struct PIDtype *PID)
+
+// Handler for the DMA channel 0 RECEIVE interrupts
+void __ISR(_DMA0_VECTOR, IPL5SOFT) DmaRxHandler(void)
+{
+    int i;
+    unsigned char ch;
+	int	evFlags;				// event flags when getting the interrupt
+
+	INTClearFlag(INT_SOURCE_DMA(DMA_CHANNEL0));	// release the interrupt in the INT controller, we're servicing int
+
+	evFlags=DmaChnGetEvFlags(DMA_CHANNEL0);	// get the event flags
+
+    if(evFlags&DMA_EV_BLOCK_DONE)
+    { // just a sanity check. we enabled just the DMA_EV_BLOCK_DONE transfer done interrupt
+        i = 0;
+        do {
+            ch = RS485_DMA_RxBuffer[i]; 
+            RS485_DMA_RxBuffer[i] = 0x00;
+            RS485RxBuffer[i] = ch;
+            i++;
+        } while (i < MAXBUFFER-1 && ch != ETX);
+        RS485RxBuffer[i] = '\0';
+        RS485RxBufferFull = true;
+        //SetupDMA_Tx();
+        timeout = 32;
+        DmaChnClrEvFlags(DMA_CHANNEL0, DMA_EV_BLOCK_DONE);       
+        DmaChnEnable(DMA_CHANNEL0);
+    }
+}
+
+// Handler for the DMA channel 1 TRANSMIT interrupts
+/*
+void __ISR(_DMA1_VECTOR, IPL5SOFT) DmaTxHandler(void)
+{
+	int	evFlags;				// event flags when getting the interrupt
+
+	INTClearFlag(INT_SOURCE_DMA(DMA_CHANNEL1));	// release the interrupt in the INT controller, we're servicing int
+
+	evFlags=DmaChnGetEvFlags(DMA_CHANNEL1);	// get the event flags
+    DMATxTestFlag = true;
+
+    if(evFlags&DMA_EV_BLOCK_DONE)
+    { 
+        DmaChnClrEvFlags(DMA_CHANNEL1, DMA_EV_BLOCK_DONE);       
+        RS485TxBufferFull = false;        
+    }
+}
+*/
+    
+
+void SetupDMA_Rx(void)
+{
+    int i;
+    DelayMs(10);    
+    RS485_ENABLE = 0;
+    // for (i = 0; i < MAXBUFFER; i++) RS485RxBuffer[i] = 0x00;     
+    
+    DmaChnOpen(DMA_CHANNEL0, 1, DMA_OPEN_MATCH);    
+    DmaChnSetMatchPattern(DMA_CHANNEL0, '\r');	// set < as ending character
+    // Set the transfer event control: what event is to start the DMA transfer    
+	// We want the UART2 RX interrupt to start our transfer
+	// also we want to enable the pattern match: transfer stops upon detection of CR
+	DmaChnSetEventControl(DMA_CHANNEL0, DMA_EV_START_IRQ_EN|DMA_EV_MATCH_EN|DMA_EV_START_IRQ(RS485_RX_IRQ));            
+	// Set the transfer source and dest addresses, source and dest sizes and the cell size
+	DmaChnSetTxfer(DMA_CHANNEL0, (void*)&RS485_RxReg, RS485_DMA_RxBuffer, 1, MAXBUFFER, 1);    
+    // Enable the transfer done event flag:
+    DmaChnSetEvEnableFlags(DMA_CHANNEL0, DMA_EV_BLOCK_DONE);		// enable the transfer done interrupt: pattern match or all the characters transferred
+	INTSetVectorPriority(INT_VECTOR_DMA(DMA_CHANNEL0), INT_PRIORITY_LEVEL_5);		// set INT controller priority
+	INTSetVectorSubPriority(INT_VECTOR_DMA(DMA_CHANNEL0), INT_SUB_PRIORITY_LEVEL_3);		// set INT controller sub-priority
+	INTEnable(INT_SOURCE_DMA(DMA_CHANNEL0), INT_ENABLED);		// enable the chn interrupt in the INT controller    
+    // Once we configured the DMA channel we can enable it
+    DmaChnEnable(DMA_CHANNEL0);
+    
+}
+
+/*
+void SetupDMA_Tx(void)
+{    
+    DelayMs(10);
+    RS485_ENABLE = 1;    
+    DelayMs(10);    
+    DmaChnOpen(DMA_CHANNEL1, 1, DMA_OPEN_MATCH);    
+    DmaChnSetMatchPattern(DMA_CHANNEL1, '\r');	// set < as ending character
+    // Set the transfer event control: what event is to start the DMA transfer    
+	// We want the UART2 TX interrupt to start our transfer
+	// also we want to enable the pattern match: transfer stops upon detection of CR
+	DmaChnSetEventControl(DMA_CHANNEL1, DMA_EV_START_IRQ_EN|DMA_EV_MATCH_EN|DMA_EV_START_IRQ(RS485_TX_IRQ));            
+	// Set the transfer source and dest addresses, source and dest sizes and the cell size
+	DmaChnSetTxfer(DMA_CHANNEL1, RS485_DMA_TxBuffer, (void*)&RS485_TxReg, 1, MAXBUFFER, 1);    
+    // Enable the transfer done event flag:
+    DmaChnSetEvEnableFlags(DMA_CHANNEL1, DMA_EV_BLOCK_DONE);		// enable the transfer done interrupt: pattern match or all the characters transferred
+	INTSetVectorPriority(INT_VECTOR_DMA(DMA_CHANNEL1), INT_PRIORITY_LEVEL_5);		// set INT controller priority
+	INTSetVectorSubPriority(INT_VECTOR_DMA(DMA_CHANNEL1), INT_SUB_PRIORITY_LEVEL_3);		// set INT controller sub-priority
+	INTEnable(INT_SOURCE_DMA(DMA_CHANNEL1), INT_ENABLED);		// enable the chn interrupt in the INT controller    
+    // Once we configured the DMA channel we can enable it
+    DmaChnEnable(DMA_CHANNEL1);
+    DmaChnStartTxfer(DMA_CHANNEL1, DMA_WAIT_NOT, 0);	// Force the DMA transfer: the UART TX flag it's already been active
+}
+*/
+
+void InitializeSystem(void) 
+{	
+    SYSTEMConfigPerformance(80000000);
+    
+    // Turn off JTAG so we get the pins back
+    mJTAGPortEnable(false);
+
+    // Configure PIC ADC for ten AD input channels
+    ADC10_ManualInit();    
+    
+    // Set up UART Rx DMA interrupts
+    SetupDMA_Rx();
+    
+    // I/O Ports:
+    PORTSetPinsDigitalOut(IOPORT_A, BIT_5);  // MOTOR_DIR4 
+    PORTSetPinsDigitalIn(IOPORT_B, BIT_0 | BIT_1 | BIT_2);  // SW1-3
+    PORTSetPinsDigitalOut(IOPORT_B, BIT_5);  // RS485_ENABLE
+    PORTSetPinsDigitalIn(IOPORT_C, BIT_13);  // SW4
+    PORTSetPinsDigitalOut(IOPORT_C, BIT_1);  // TEST_OUT
+    PORTSetPinsDigitalIn(IOPORT_D, BIT_7);  // SW5
+    PORTSetPinsDigitalOut(IOPORT_D, BIT_8 | BIT_9 | BIT_10 | BIT_11 | BIT_13);  // EE_WR, LED, MOTOR DIR #5, #3, #2
+    PORTSetPinsDigitalIn(IOPORT_E, BIT_9 | BIT_5 | BIT_7 | BIT_8);  // ENCODER DIRECTION INPUTS 1-4
+    PORTSetPinsDigitalOut(IOPORT_G, BIT_12);  // MOTOR DIR #1       
+    
+    mCNOpen(CN_ON, CN1_ENABLE | CN2_ENABLE | CN3_ENABLE | CN4_ENABLE, CN1_PULLUP_ENABLE | CN2_PULLUP_ENABLE | CN3_PULLUP_ENABLE | CN4_PULLUP_ENABLE);
+    ConfigIntCN(CHANGE_INT_ON | CHANGE_INT_PRI_2);    
+    
+    
+    // Set up timers as counters
+    T1CON = 0x00;
+    T1CONbits.TCS = 1; // Use external counter as input source (motor encoder)
+    T1CONbits.TCKPS1 = 0; // 1:1 Prescaler
+    T1CONbits.TCKPS0 = 0;
+    T1CONbits.TSYNC = 1;
+    PR1 = 0xFFFF;
+    T1CONbits.TON = 1; // Let her rip     
+
+    T3CON = 0x00;
+    T3CONbits.TCS = 1; // Use external counter as input source (motor encoder)
+    T3CONbits.TCKPS2 = 0; // 1:1 Prescaler
+    T3CONbits.TCKPS1 = 0;
+    T3CONbits.TCKPS0 = 0;
+    PR3 = 0xFFFF;
+    T3CONbits.TON = 1; // Let her rip 
+
+    T4CON = 0x00;
+    T4CONbits.TCS = 1; // Use external counter as input source (motor encoder)
+    T4CONbits.TCKPS2 = 0; // 1:1 Prescaler
+    T4CONbits.TCKPS1 = 0;
+    T4CONbits.TCKPS0 = 0;
+    T4CONbits.T32 = 0; // TMRx and TMRy form separate 16-bit timers
+    PR4 = 0xFFFF;
+    T4CONbits.TON = 1; // Let her rip 
+
+    T5CON = 0x00;
+    T5CONbits.TCS = 1; // Use external counter as input source (motor encoder)
+    T5CONbits.TCKPS2 = 0; // 1:1 Prescaler
+    T5CONbits.TCKPS1 = 0;
+    T5CONbits.TCKPS0 = 0;
+    PR5 = 0xFFFF;
+    T5CONbits.TON = 1; // Let her rip     
+    
+    // Set up Timer 2 for PWM time base    
+    T2CON = 0x00;
+    T2CONbits.TCKPS2 = 0; // 1:1 Prescaler
+    T2CONbits.TCKPS1 = 0;
+    T2CONbits.TCKPS0 = 0;    
+    PR2 = 4000; // Use 50 microsecond rollover for 20 khz
+    T2CONbits.TON = 1; // Let her rip   
+    ConfigIntTimer2(T2_INT_ON | T2_INT_PRIOR_2);                    
+
+    // Set up PWM OC1
+    OC1CON = 0x00;
+    OC1CONbits.OC32 = 0; // 16 bit PWM
+    OC1CONbits.ON = 1; // Turn on PWM
+    OC1CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
+    OC1CONbits.OCM2 = 1; // PWM runState enabled, no fault pin
+    OC1CONbits.OCM1 = 1;
+    OC1CONbits.OCM0 = 0;
+    OC1RS = 0;
+
+    // Set up PWM OC2
+    OC2CON = 0x00;
+    OC2CONbits.OC32 = 0; // 16 bit PWM
+    OC2CONbits.ON = 1; // Turn on PWM
+    OC2CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
+    OC2CONbits.OCM2 = 1; // PWM runState enabled, no fault pin
+    OC2CONbits.OCM1 = 1;
+    OC2CONbits.OCM0 = 0;
+    OC2RS = 0;
+
+    // Set up PWM OC3
+    OC3CON = 0x00;
+    OC3CONbits.OC32 = 0; // 16 bit PWM
+    OC3CONbits.ON = 1; // Turn on PWM
+    OC3CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
+    OC3CONbits.OCM2 = 1; // PWM runState enabled, no fault pin
+    OC3CONbits.OCM1 = 1;
+    OC3CONbits.OCM0 = 0;
+    OC3RS = 0;
+
+    // Set up PWM OC4
+    OC4CON = 0x00;
+    OC4CONbits.OC32 = 0; // 16 bit PWM
+    OC4CONbits.ON = 1; // Turn on PWM
+    OC4CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
+    OC4CONbits.OCM2 = 1; // PWM runState enabled, no fault pin
+    OC4CONbits.OCM1 = 1;
+    OC4CONbits.OCM0 = 0;
+    OC4RS = 0;
+    
+    // Set up PWM OC5
+    OC5CON = 0x00;
+    OC5CONbits.OC32 = 0; // 16 bit PWM
+    OC5CONbits.ON = 1; // Turn on PWM
+    OC5CONbits.OCTSEL = 0; // Use Timer 2 as PWM time base
+    OC5CONbits.OCM2 = 1; // PWM runState enabled, no fault pin
+    OC5CONbits.OCM1 = 1;
+    OC5CONbits.OCM0 = 0;
+    OC5RS = 0;         
+    
+    // Set up HOST UART    
+    UARTConfigure(HOSTuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
+    UARTSetFifoMode(HOSTuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
+    UARTSetLineControl(HOSTuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
+    UARTSetDataRate(HOSTuart, SYS_FREQ, 57600);
+    UARTEnable(HOSTuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
+
+    // Configure HOST UART Interrupts
+    INTEnable(INT_SOURCE_UART_TX(HOSTuart), INT_DISABLED);
+    INTEnable(INT_SOURCE_UART_RX(HOSTuart), INT_ENABLED);
+    INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
+    INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);    
+    
+    // Set up RS485 UART    
+    UARTConfigure(RS485uart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
+    UARTSetFifoMode(RS485uart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
+    UARTSetLineControl(RS485uart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
+    ActualRS485BaudRate = UARTSetDataRate(RS485uart, SYS_FREQ, 921600);
+    // ActualRS485BaudRate = UARTSetDataRate(RS485uart, SYS_FREQ, 2000000);
+    UARTEnable(RS485uart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
+
+    // Configure RS485 UART Interrupts
+    INTEnable(INT_SOURCE_UART_TX(RS485uart), INT_DISABLED);
+    INTEnable(INT_SOURCE_UART_RX(RS485uart), INT_DISABLED); 
+    INTSetVectorPriority(INT_VECTOR_UART(RS485uart), INT_PRIORITY_LEVEL_2);
+    INTSetVectorSubPriority(INT_VECTOR_UART(RS485uart), INT_SUB_PRIORITY_LEVEL_0);  
+    
+ 
+    // Set up XBEE UART    
+    UARTConfigure(XBEEuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
+    UARTSetFifoMode(XBEEuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
+    UARTSetLineControl(XBEEuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
+    ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 57600);
+    // ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 2000000);
+    UARTEnable(XBEEuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
+
+    // Configure XBEE UART Interrupts
+    INTEnable(INT_SOURCE_UART_TX(XBEEuart), INT_DISABLED);
+    INTEnable(INT_SOURCE_UART_RX(XBEEuart), INT_ENABLED); 
+    INTSetVectorPriority(INT_VECTOR_UART(XBEEuart), INT_PRIORITY_LEVEL_2);
+    INTSetVectorSubPriority(INT_VECTOR_UART(XBEEuart), INT_SUB_PRIORITY_LEVEL_0);        
+    
+    // Turn on the interrupts
+    INTEnableSystemMultiVectoredInt();   
+}//end UserInit
+
+
+// RS485 UART interrupt handler it is set at priority level 2
+void __ISR(RS485_VECTOR, ipl2) IntRS485UartHandler(void) 
+{
+    unsigned char ch;
+    static unsigned short RS485RxIndex = 0;
+
+    if (INTGetFlag(INT_SOURCE_UART_RX(RS485uart))) 
+        INTClearFlag(INT_SOURCE_UART_RX(RS485uart));    
+    /*
+    if (RS485bits.OERR || RS485bits.FERR) {
+        if (UARTReceivedDataIsAvailable(RS485uart))
+            ch = UARTGetDataByte(RS485uart);
+        RS485bits.OERR = 0;
+        RS485RxIndex = 0;
+    } else if (INTGetFlag(INT_SOURCE_UART_RX(RS485uart))) {
+        INTClearFlag(INT_SOURCE_UART_RX(RS485uart));
+        if (UARTReceivedDataIsAvailable(RS485uart)) {
+            ch = UARTGetDataByte(RS485uart);
+            {
+                if (ch == LF || ch == 0);
+                else if (ch == CR) 
+                {
+                    if (RS485RxIndex < (MAXBUFFER-1)) 
+                    {
+                        RS485_DMA_RxBuffer[RS485RxIndex] = CR;
+                        RS485_DMA_RxBuffer[RS485RxIndex + 1] = '\0'; 
+                        RS485RxBufferFull = true;
+                    }
+                    RS485RxIndex = 0;
+                }                
+                else 
+                {
+                    if (RS485RxIndex < (MAXBUFFER-1))
+                        RS485_DMA_RxBuffer[RS485RxIndex++] = ch;                    
+                }
+            }
+        }
+    }
+    */
+    
+    if (INTGetFlag(INT_SOURCE_UART_TX(RS485uart))) 
+    {        
+        INTClearFlag(INT_SOURCE_UART_TX(RS485uart));
+        if (RS485TxIndex < RS485TxLength)
+        {
+            if (!RS485_ENABLE)
+            {
+                RS485_ENABLE = 1;
+                DelayUs(1);  
+            }
+            while(!UARTTransmitterIsReady(RS485uart));        
+            ch = RS485TxBuffer[RS485TxIndex++];
+            UARTSendDataByte (RS485uart, ch);
+        }
+        else
+        {
+            RS485TxIndex = 0;
+            INTEnable(INT_SOURCE_UART_TX(RS485uart), INT_DISABLED);
+            DelayUs(10);  
+            RS485_ENABLE = 0;
+        }
+    }
+}
+
+int StartRS485Tx()
+{
+    unsigned char ch;
+    RS485TxLength = strlen(RS485TxBuffer);
+    if (RS485TxLength > MAXBUFFER) return 0;    
+    RS485_ENABLE = 1;
+    DelayUs(1);    
+    RS485TxIndex = 0;
+    INTEnable(INT_SOURCE_UART_TX(RS485uart), INT_ENABLED);
+    ch = RS485TxBuffer[RS485TxIndex++];
+    while(!UARTTransmitterIsReady(RS485uart));
+    UARTSendDataByte (RS485uart, ch);    
+    return RS485TxLength;
+}
+
+/*
+    printf("\r#1: Testing Feather Servos & PID");
+    MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 1;
+    PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
+    RS485_ENABLE = 0;    
+        
+    DelayMs(100);
+    printf("\r\rFeather Servo NO USB version");
+    printf("\rInitializing Feather Servo Board at address 0x80: ");
+    if (initializePCA9685(PCA9685_ADDRESS)) printf(" SUCCESS");
+    else printf(" ERROR");        
+        
+    printf("\rSetting servo pulse: ");
+        
+    while(1)
+    {        
+        if (intFlag)
+        {
+            intFlag = false;
+            TEST_OUT = 1;
+            IFS1bits.AD1IF = 0;
+            while(!IFS1bits.AD1IF);        
+            AD1CON1bits.ASAM = 0;        // Pause sampling. 
+            for (i = 0; i < MAXPOTS; i++)
+                ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
+            AD1CON1bits.ASAM = 1;        // Restart sampling.    
+            for (i = 0; i < 4; i++)
+            {
+                RCservoPos[i] = (short)(ADresult[i+6]/4) + 22; 
+            }
+            DisplayCounter++;
+            if (DisplayCounter > 10) 
+            {
+                DisplayCounter = 0;
+                printf("\r#%d: RC Servos: %d, %d, %d, %d, %d, %d, %d, %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3], RCservoPos[4], RCservoPos[5], RCservoPos[6], RCservoPos[7]);
+            }            
+             
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf(" Servo 0 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf("  Servo 1 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf("  Servo 2 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf("  Servo 3 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 4, 0, RCservoPos[0])) printf(" Servo 4 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 5, 0, RCservoPos[1])) printf("  Servo 5 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 6, 0, RCservoPos[2])) printf("  Servo 6 ERROR");
+            if (!setPCA9685outputs (PCA9685_ADDRESS, 7, 0, RCservoPos[3])) printf("  Servo 7 ERROR");
+            
+            
+            mAD1IntEnable(INT_ENABLED);
+        }        
+        // printf("\r#%d Servo position: %d", counter++, servoPos);           
+        
+        if (HOSTRxBufferFull)
+        {
+            HOSTRxBufferFull = false;
+            printf("\rReceived: %s", HOSTRxBuffer);
+        }
+        // 
+    } // end while(1)    
+*/ 
+
+
+long POTcontrol(long servoID, struct PIDtype *PID)
 {
     short Error;     
     short actualPosition;
@@ -1155,7 +1365,12 @@ long PIDcontrol(long servoID, struct PIDtype *PID)
     float PCorr = 0, ICorr = 0, DCorr = 0;    
     unsigned char sensorError = false;
     short i;
-    static short displayCounter = 0;               
+    static short displayCounter = 0;         
+    
+    PID[servoID].ADCommand = (short)(ADresult[servoID+6]);
+    if (PID[servoID].ADCommand > MAX_COMMAND_COUNTS) PID[servoID].ADCommand = MAX_COMMAND_COUNTS; 
+    if (PID[servoID].ADCommand < MIN_COMMAND_COUNTS) PID[servoID].ADCommand = MIN_COMMAND_COUNTS; 
+    PID[servoID].ADActual = (short)(ADresult[servoID+1]);
     
     if (PID[servoID].ADActual < 341) PID[servoID].quadCurrent = QUAD_ONE;
     else if (PID[servoID].ADActual < 682) PID[servoID].quadCurrent = QUAD_TWO;
@@ -1224,9 +1439,9 @@ long PIDcontrol(long servoID, struct PIDtype *PID)
         sensorError = true;
     }    
     
+    /*
     if (servoID == 0 && displayFlag)
     {
-        displayCounter++;
         if (displayCounter >= 20)
         {
             displayCounter = 0;
@@ -1234,6 +1449,220 @@ long PIDcontrol(long servoID, struct PIDtype *PID)
             else printf("\rCOM: %d ACT: %d ERR: %d SUM: %d P: %0.1f D: %0.1f I: %0.1f PWM: %d ", commandPosition, actualPosition, Error, PID[servoID].sumError, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
         }
     }
-    PID[servoID].reset = false;   
+    */       
     return 1;
 }
+
+// POT_MODE
+// CONSTANT_VELOCITY_MODE
+// ENCODER_MODE
+
+void ResetPID()
+{
+    int i, j;
+    for (i = 0; i < NUMMOTORS; i++)
+    {
+        PID[i].sumError = 0; // For 53:1 ratio Servo City motor
+        PID[i].PWMvalue = 0;
+        PID[i].ADActual = 0;
+        PID[i].ADCommand = 0;        
+        PID[i].saturation = false;
+        PID[i].ErrorCounter = 0;
+        PID[i].previousPosition = 0;
+        PID[i].Mode = 0;
+        PID[i].CommandVelocity = 0.0;        
+        PID[i].CommandPos = 0;
+        PID[i].ActualPos = 0;
+        PID[i].Time = 0;
+        PID[i].Halted = false;
+        EncoderOne = 0;
+        EncoderTwo = 0;
+        EncoderThree = 0;
+        EncoderFour = 0;
+        for (j = 0; j < FILTERSIZE; j++) PID[i].error[j] = 0;
+    }
+    errIndex = 0;
+}
+
+void InitPID()
+{
+    ResetPID();
+    int i;
+    for (i = 0; i < NUMMOTORS; i++)
+    {
+        if (i == 3)
+        {
+            PID[i].kP = KKP;
+            PID[i].kI = KKI;
+            PID[i].kD = KKD;            
+            PID[i].PWMoffset = KK_PWM_OFFSET;
+            PID[i].Mode = ENCODER_MODE;      
+        }
+        else
+        {
+            PID[i].kP = KP;
+            PID[i].kI = KI;
+            PID[i].kD = KD;
+            PID[i].PWMoffset = PWM_OFFSET;
+            PID[i].Mode = POT_MODE;
+        }        
+        PID[i].quadCurrent = QUAD_NONE;
+        PID[i].quadPrevious = QUAD_NONE;
+        
+    }
+}
+
+
+#define EncoderOne TMR1
+#define EncoderTwo TMR5
+#define EncoderThree TMR3
+#define EncoderFour TMR4
+
+#define EncoderOneDir PORTEbits.RE9
+#define EncoderTwoDir PORTEbits.RE5
+#define EncoderThreeDir PORTEbits.RE7
+#define EncoderFourDir PORTEbits.RE8
+
+long ENCODERcontrol(long servoID, struct PIDtype *PID)
+{
+    long Error;         
+    long totalDerError = 0;
+    long derError;    
+    float PCorr = 0, ICorr = 0, DCorr = 0;    
+    unsigned char sensorError = false;
+    unsigned char EncoderDirection;
+    static short displayCounter = 0;
+    short i;
+    
+    if (PID[servoID].Halted)
+    {
+        PID[servoID].PWMvalue = 0;
+        return 0;
+    }
+    
+    
+    PID[servoID].Time++;    
+    if (servoID == 1)
+    {
+        EncoderDirection = !EncoderOneDir;
+        if (EncoderDirection) PID[servoID].ActualPos = (long)EncoderOne;
+        else PID[servoID].ActualPos = 0 - (long)EncoderOne;
+        
+    }    
+    else if (servoID == 2)
+    {
+        EncoderDirection = !EncoderTwoDir;
+        if (EncoderDirection) PID[servoID].ActualPos = (long)EncoderTwo;
+        else PID[servoID].ActualPos = 0 - (long)EncoderTwo;
+    }
+    else if (servoID == 3)
+    {
+        EncoderDirection = !EncoderThreeDir;
+        if (EncoderDirection) PID[servoID].ActualPos = (long)EncoderThree;
+        else PID[servoID].ActualPos = 0 - (long)EncoderThree;
+    }
+    else if (servoID == 4)
+    {
+        EncoderDirection = !EncoderFourDir;
+        if (EncoderDirection) PID[servoID].ActualPos = (long)EncoderFour;
+        else PID[servoID].ActualPos = 0 - (long)EncoderFour;
+    }                
+    
+    if (PID[servoID].CommandPos > 0) 
+    {
+            if (PID[servoID].ActualPos >= PID[servoID].CommandPos) 
+            {
+                printf("\rHALTED: COM: %ld, ACT: %ld", PID[servoID].CommandPos, PID[servoID].ActualPos);
+                PID[servoID].Halted = true;
+                return 0;
+            }
+    }
+    else if (PID[servoID].CommandPos < 0) 
+    {
+        if (PID[servoID].ActualPos <= PID[servoID].CommandPos) 
+        {
+            printf("\rHALTED: COM: %ld, ACT: %ld", PID[servoID].CommandPos, PID[servoID].ActualPos);
+            PID[servoID].Halted = true;
+            return 0;
+        }            
+    }
+    else
+    {
+        PID[servoID].Halted = true;
+        return 0;            
+    }
+    
+    Error = PID[servoID].ActualPos - PID[servoID].CommandPos;
+    PID[servoID].error[errIndex] = Error;                
+         
+    // if (!PID[servoID].saturation) 
+    PID[servoID].sumError = PID[servoID].sumError + (long)Error; 
+        
+    totalDerError = 0;
+    for (i = 0; i < FILTERSIZE; i++)
+        totalDerError = totalDerError + PID[servoID].error[i];
+    derError = totalDerError / FILTERSIZE;
+    
+    if (PID[servoID].sumError > MAXSUM) PID[servoID].sumError = MAXSUM;
+    if (PID[servoID].sumError < -MAXSUM) PID[servoID].sumError = -MAXSUM;        
+    
+    PCorr = ((float)Error) * -PID[servoID].kP;    
+    ICorr = ((float)PID[servoID].sumError)  * -PID[servoID].kI;
+    DCorr = ((float)derError) * -PID[servoID].kD;
+
+    float PIDcorrection = PCorr + ICorr + DCorr;
+    
+    if (PIDcorrection == 0) PID[servoID].PWMvalue = 0;
+    else if (PIDcorrection < 0) PID[servoID].PWMvalue = (long) (PIDcorrection - PID[servoID].PWMoffset);            
+    else PID[servoID].PWMvalue = (long) (PIDcorrection + PID[servoID].PWMoffset);                    
+           
+    /*
+    if (abs(Error) < 4) 
+    {
+        PID[servoID].PWMvalue = 0;
+        if (PID[servoID].ErrorCounter > 0) PID[servoID].ErrorCounter--;
+    }
+    else PID[servoID].ErrorCounter = 100;
+    if (PID[servoID].ErrorCounter == 0) PID[servoID].sumError = 0;
+    */
+        
+    if (PID[servoID].PWMvalue > PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else if (PID[servoID].PWMvalue < -PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = -PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else PID[servoID].saturation = false;
+    
+    //if (PID[servoID].ActualPos > 1024 && PID[servoID].PWMvalue > 0) PID[servoID].PWMvalue = 0;
+    //if (PID[servoID].ActualPos < 0 && PID[servoID].PWMvalue < 0) PID[servoID].PWMvalue = 0;   
+    
+    if (PID[servoID].PWMvalue > PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else if (PID[servoID].PWMvalue < -PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = -PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else PID[servoID].saturation = false;    
+    
+    if (servoID == 3 && displayFlag)
+    {
+        displayCounter++;
+        if (displayCounter >= 20)
+        {
+            displayCounter = 0;
+            printf("\r>>COM: %ld, ACT: %d, DIR: %d, ERR: %ld, SUM: %ld P: %0.1f D: %0.1f I: %0.1f PWM: %d ", PID[servoID].CommandPos, PID[servoID].ActualPos, EncoderDirection, Error, PID[servoID].sumError, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
+            // printf("\rCOM: %ld, ACT: %ld, ERR: %ld SUM: %ld PWM: %d", PID[servoID].CommandPos, PID[servoID].ActualPos, Error, PID[servoID].sumError, PID[servoID].PWMvalue);
+        }
+    }         
+    return 1;
+}
+

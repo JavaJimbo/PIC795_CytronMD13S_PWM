@@ -57,7 +57,7 @@
 #define LED_ON_REGISTER 0x06
 #define MAX_LED_CHANNEL 15
 
-#define PCABUS I2C3
+#define PCABUS I2C1
 
 extern unsigned char PCAReadByte (unsigned char device, unsigned char PCAcontrolRegister, unsigned char *ptrData);
 extern unsigned char PCAWriteByte (unsigned char device, unsigned char PCAcontrolRegister, unsigned char data);
