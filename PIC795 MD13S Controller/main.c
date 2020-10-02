@@ -20,9 +20,12 @@
  * 9-21-20: 
  * 9-22-20: Got encoders working nicely in Destination mode - enter positions by text.
  * 9-23-20: Eliminated Velocity mode for now.
+ * 9-29-20: Testing RC servo motors with Feather board. Baudrate: 115200
+ * 10-2-20: Four RC servos working with pots controlling Feather board.
  ***********************************************************************************/
 #define USE_PID
 #define SUCCESS 0
+#define PCA9685_ADDRESS 0x80 // Basic default address for Adafruit Feather Servo Board 
 
 enum {
     POT_MODE = 0,
@@ -293,7 +296,7 @@ int main(void)
     short SWcounter = 0;    
     unsigned char runMode = LOCAL;
     short startAddress = 0x0000;
-    #define NUM_RC_SERVOS 8
+    #define NUM_RC_SERVOS 4
     short RCservoPos[NUM_RC_SERVOS];
     short DisplayCounter = 0;
     short testCounter = 0;
@@ -301,17 +304,27 @@ int main(void)
     short ENCdisplayCounter = 0;    
     long Destination = 30;    
     
+    
     InitPID();     
     DelayMs(10);
     
     InitializeSystem();      
-
+    
+    
+    DelayMs(100);
+    printf("\r\rFeather Board - 4 servos");
+    printf("\rInitializing Feather Servo Board at address 0x80: ");
+    if (initializePCA9685(PCA9685_ADDRESS)) printf(" SUCCESS");
+    else printf(" ERROR");    
+    
 #ifdef USE_PID
+    /*
     printf("\r\rTesting Constant Velocity mode...\r");    
     if (runState==LOCAL) printf("RunMode = LOCAL");
     else if (runState==REMOTE) printf("RunMode = REMOTE");
     else if (runState==JOG) printf("RunMode = JOG");
     else printf("RunMode = STANDBY");
+    */
 #else
     printf("\r\rSERVOS Disabled\r");    
     if (runState==LOCAL) printf("RunMode = LOCAL");
@@ -386,8 +399,16 @@ int main(void)
             AD1CON1bits.ASAM = 1;        // Restart sampling.                                 
             
             if (runState)
-            {               
-                mAD1IntEnable(INT_ENABLED);
+            {            
+                for (i = 0; i < NUM_RC_SERVOS; i++) RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
+                // printf("\r#%d: 1 = %d, 2 = %d, 3 = %d, 4 = %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3]);
+                
+                if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf(" #0 ERROR");
+                if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf(" #1 ERROR");
+                if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf(" #2 ERROR");
+                if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf(" #3 ERROR");                
+
+                /*
                 for (i = 0; i < NUMMOTORS; i++)
                 {                             
                     if (runState == JOG) 
@@ -456,8 +477,10 @@ int main(void)
                     }
                     
                 }                                                
+                */
                 errIndex++; 
                 if (errIndex >= FILTERSIZE) errIndex = 0;
+                
             }
             else            
             {
@@ -702,7 +725,7 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void)
     }
     
     intCounter++;
-    if (intCounter >= 80) // 50
+    if (intCounter >= 80)// -80) // 2000
     {
         intCounter = 0;
         intFlag = true;
@@ -1172,7 +1195,7 @@ void InitializeSystem(void)
     UARTConfigure(HOSTuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
     UARTSetFifoMode(HOSTuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
     UARTSetLineControl(HOSTuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    UARTSetDataRate(HOSTuart, SYS_FREQ, 57600);
+    UARTSetDataRate(HOSTuart, SYS_FREQ, 115200);
     UARTEnable(HOSTuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
 
     // Configure HOST UART Interrupts
