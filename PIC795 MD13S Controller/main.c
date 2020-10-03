@@ -22,6 +22,7 @@
  * 9-23-20: Eliminated Velocity mode for now.
  * 9-29-20: Testing RC servo motors with Feather board. Baudrate: 115200
  * 10-2-20: Four RC servos working with pots controlling Feather board.
+ * 10-3-20: Added Velocity variable to limit speed.
  ***********************************************************************************/
 #define USE_PID
 #define SUCCESS 0
@@ -46,7 +47,7 @@ enum {
 #define KK_PWM_OFFSET 100
 #define KKP 8.0
 #define KKI 0.04
-#define KKD 30.0 
+#define KKD 8.0 // 30
 
 #define MAX_COMMAND_COUNTS 850
 #define MIN_COMMAND_COUNTS 100
@@ -184,8 +185,9 @@ struct PIDtype
     short PWMvalue;
     short ADActual;
     long  CommandPos;
+    long  Destination;
     long  ActualPos;
-    float CommandVelocity;    
+    float Velocity;    
     long  Time;
     short ADCommand;
     short ErrorCounter;
@@ -297,34 +299,34 @@ int main(void)
     unsigned char runMode = LOCAL;
     short startAddress = 0x0000;
     #define NUM_RC_SERVOS 4
-    short RCservoPos[NUM_RC_SERVOS];
+    short RCservoPos[NUM_RC_SERVOS] = {0,0,0,0};
+    short PreviousRCservoPos[NUM_RC_SERVOS] = {0,0,0,0};
     short DisplayCounter = 0;
     short testCounter = 0;
     short MotorFour;
-    short ENCdisplayCounter = 0;    
-    long Destination = 30;    
+    short ENCdisplayCounter = 0;           
     
     
     InitPID();     
     DelayMs(10);
     
-    InitializeSystem();      
-    
+    InitializeSystem();          
     
     DelayMs(100);
+    
+    
     printf("\r\rFeather Board - 4 servos");
     printf("\rInitializing Feather Servo Board at address 0x80: ");
     if (initializePCA9685(PCA9685_ADDRESS)) printf(" SUCCESS");
     else printf(" ERROR");    
     
-#ifdef USE_PID
-    /*
+    
+#ifdef USE_PID    
     printf("\r\rTesting Constant Velocity mode...\r");    
     if (runState==LOCAL) printf("RunMode = LOCAL");
     else if (runState==REMOTE) printf("RunMode = REMOTE");
     else if (runState==JOG) printf("RunMode = JOG");
-    else printf("RunMode = STANDBY");
-    */
+    else printf("RunMode = STANDBY");    
 #else
     printf("\r\rSERVOS Disabled\r");    
     if (runState==LOCAL) printf("RunMode = LOCAL");
@@ -390,7 +392,10 @@ int main(void)
         if (intFlag)
         {
             intFlag = false;
-            TEST_OUT = 1;
+            
+            if (TEST_OUT) TEST_OUT = 0;
+            else TEST_OUT = 1;                    
+            
             IFS1bits.AD1IF = 0;
             while(!IFS1bits.AD1IF);        
             AD1CON1bits.ASAM = 0;        // Pause sampling. 
@@ -399,16 +404,33 @@ int main(void)
             AD1CON1bits.ASAM = 1;        // Restart sampling.                                 
             
             if (runState)
-            {            
-                for (i = 0; i < NUM_RC_SERVOS; i++) RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
-                // printf("\r#%d: 1 = %d, 2 = %d, 3 = %d, 4 = %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3]);
+            {        
                 
-                if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf(" #0 ERROR");
-                if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf(" #1 ERROR");
-                if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf(" #2 ERROR");
-                if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf(" #3 ERROR");                
-
-                /*
+                for (i = 0; i < NUM_RC_SERVOS; i++) RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
+                // printf("\r#%d: 1 = %d, 2 = %d, 3 = %d, 4 = %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3]);                
+                
+                if (PreviousRCservoPos[0]!=RCservoPos[0])
+                {
+                    PreviousRCservoPos[0]=RCservoPos[0];
+                    if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf("\r#0 ERROR");
+                }
+                if (PreviousRCservoPos[1]!=RCservoPos[1])
+                {
+                    PreviousRCservoPos[1]=RCservoPos[1];
+                    if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf("\r#1 ERROR");
+                }
+                if (PreviousRCservoPos[2]!=RCservoPos[2])
+                {
+                    PreviousRCservoPos[2]=RCservoPos[2];
+                    if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf("\r#2 ERROR");
+                }
+                if (PreviousRCservoPos[3]!=RCservoPos[3])
+                {
+                    PreviousRCservoPos[3]=RCservoPos[3];
+                    if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf("\r#3 ERROR");
+                }                
+                
+                
                 for (i = 0; i < NUMMOTORS; i++)
                 {                             
                     if (runState == JOG) 
@@ -477,7 +499,7 @@ int main(void)
                     }
                     
                 }                                                
-                */
+                
                 errIndex++; 
                 if (errIndex >= FILTERSIZE) errIndex = 0;
                 
@@ -487,8 +509,7 @@ int main(void)
                 for (i = 0; i < NUMMOTORS; i++) PID[i].sumError = 0;
                 PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
                 LED = 0;
-            }   
-            TEST_OUT = 0;
+            }               
         }    
 #endif        
         
@@ -569,16 +590,17 @@ int main(void)
                         else
                         {
                             runState = runMode;
-                            if (runState==LOCAL) printf("Run State = LOCAL");
-                            else if (runState==REMOTE) printf("Run State = REMOTE");
-                            else if (runState==JOG) printf("Run State = JOG");
-                            else printf("ERROR RunMode = %d", runMode);
+                            if (runState==LOCAL) printf("\rRun State = LOCAL");
+                            else if (runState==REMOTE) printf("\rRun State = REMOTE");
+                            else if (runState==JOG) printf("\rRun State = JOG");
+                            else printf("\rERROR RunMode = %d", runMode);
                             ENCdisplayCounter = 0;
                             PID[0].Halted = false;
                             PID[0].Mode = POT_MODE;
                             PID[3].Halted = false;
                             PID[3].Mode = ENCODER_MODE;
-                            PID[3].CommandPos = Destination;
+                            PID[3].Time = 0;
+                            printf(", Destination: %ld, Velocity: %0.3f", PID[3].Destination, PID[3].Velocity);
                         }                         
                         break;
                     case 'M':
@@ -593,9 +615,15 @@ int main(void)
                         }   
                         break;
                     case 'Z':
-                        Destination = (long)floValue;
-                        printf("\rDestination = %ld", Destination);
+                        if (q) PID[3].Destination = (long)floValue;
+                        printf("Destination: %ld, Velocity: %0.3f", PID[3].Destination, PID[3].Velocity);
                         break;
+                        
+                    case 'V':
+                        if (q) PID[3].Velocity = (float)floValue;
+                        printf("Destination: %ld, Velocity: %0.3f", PID[3].Destination, PID[3].Velocity);
+                        break;
+                        
                     case 'T':
                         if (ADdisplay)
                         {
@@ -608,12 +636,15 @@ int main(void)
                             printf("\rPot display ON");
                         }
                         break;
-                    default:
-                        if (command < ' ') printf("\rCommand: %c", (command - 1 + 'A'));
+                    case 'Q':
+                        printf("\rkP = %0.1f, kI = %0.3f, kD = %0.1f, Offset: %d\r", PID[0].kP, PID[0].kI, PID[0].kD, PID[0].PWMoffset);
+                        break;
+                    default:                        
+                        if (command < ' ') printf("\rCommand: #%d => %c", command, (command - 1 + 'A'));
                         else printf("\rCommand: %c", command);
                         break;
                 } // end switch command                
-                printf("\rkP = %0.1f, kI = %0.3f, kD = %0.1f, Offset: %d\r", PID[0].kP, PID[0].kI, PID[0].kD, PID[0].PWMoffset);
+                
                 CONTINUE1: continue;
                 command = 0;
             } // End if command             
@@ -714,7 +745,7 @@ void __ISR(_TIMER_2_VECTOR, ipl5) Timer2Handler(void)
     static int LEDcounter = 10000;
     static int memoryCounter = 625; 
     
-    mT2ClearIntFlag(); // clear the interrupt flag    
+    mT2ClearIntFlag(); // clear the interrupt flag        
     
     LEDcounter++;
     if (LEDcounter >= 10000)
@@ -919,6 +950,10 @@ static unsigned long i = 0;
                     HOSTRxBuffer[i++] = ch;
                     HOSTRxBuffer[i] = '\0';
                     i = 0;
+                    while(!UARTTransmitterIsReady(HOSTuart));
+                    UARTSendDataByte (HOSTuart, '\r');
+                    while(!UARTTransmitterIsReady(HOSTuart));
+                    UARTSendDataByte (HOSTuart, '\n');
                 }                
                 else if (ch < ' ')
                 {
@@ -1493,7 +1528,6 @@ void ResetPID()
         PID[i].ErrorCounter = 0;
         PID[i].previousPosition = 0;
         PID[i].Mode = 0;
-        PID[i].CommandVelocity = 0.0;        
         PID[i].CommandPos = 0;
         PID[i].ActualPos = 0;
         PID[i].Time = 0;
@@ -1528,7 +1562,9 @@ void InitPID()
             PID[i].kD = KD;
             PID[i].PWMoffset = PWM_OFFSET;
             PID[i].Mode = POT_MODE;
-        }        
+        }      
+        PID[i].Velocity = 1.0;
+        PID[i].Destination = 180;
         PID[i].quadCurrent = QUAD_NONE;
         PID[i].quadPrevious = QUAD_NONE;
         
@@ -1563,8 +1599,15 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
         return 0;
     }
     
+    if (PID[servoID].Velocity != (float)0.0)
+    {
+        PID[servoID].Time++;    
+        PID[servoID].CommandPos = (long)(PID[servoID].Velocity * (float)PID[servoID].Time);
+        if ( abs(PID[servoID].CommandPos) > abs(PID[servoID].Destination) )
+            PID[servoID].CommandPos = PID[servoID].Destination;
+    }
+    else PID[servoID].CommandPos = PID[servoID].Destination;
     
-    PID[servoID].Time++;    
     if (servoID == 1)
     {
         EncoderDirection = !EncoderOneDir;
@@ -1591,31 +1634,31 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
         else PID[servoID].ActualPos = 0 - (long)EncoderFour;
     }                
     
-    if (PID[servoID].CommandPos > 0) 
+    if (PID[servoID].Destination >= 0) 
     {
-            if (PID[servoID].ActualPos >= PID[servoID].CommandPos) 
-            {
-                printf("\rHALTED: COM: %ld, ACT: %ld", PID[servoID].CommandPos, PID[servoID].ActualPos);
-                PID[servoID].Halted = true;
-                return 0;
-            }
-    }
-    else if (PID[servoID].CommandPos < 0) 
-    {
-        if (PID[servoID].ActualPos <= PID[servoID].CommandPos) 
+        if (PID[servoID].ActualPos >= (long)(PID[servoID].Destination)) 
         {
-            printf("\rHALTED: COM: %ld, ACT: %ld", PID[servoID].CommandPos, PID[servoID].ActualPos);
+            printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
+            PID[servoID].Halted = true;
+            return 0;
+        }
+    }
+    else
+    {
+        if (PID[servoID].ActualPos <= (long)(PID[servoID].Destination))
+        {
+            printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
             PID[servoID].Halted = true;
             return 0;
         }            
     }
-    else
-    {
-        PID[servoID].Halted = true;
-        return 0;            
-    }
+    // else
+    // {
+    //    PID[servoID].Halted = true;
+    //    return 0;            
+    // }
     
-    Error = PID[servoID].ActualPos - PID[servoID].CommandPos;
+    Error = PID[servoID].ActualPos - (long)(PID[servoID].CommandPos);
     PID[servoID].error[errIndex] = Error;                
          
     // if (!PID[servoID].saturation) 
@@ -1682,7 +1725,7 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
         if (displayCounter >= 20)
         {
             displayCounter = 0;
-            printf("\r>>COM: %ld, ACT: %d, DIR: %d, ERR: %ld, SUM: %ld P: %0.1f D: %0.1f I: %0.1f PWM: %d ", PID[servoID].CommandPos, PID[servoID].ActualPos, EncoderDirection, Error, PID[servoID].sumError, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
+            printf("\r>T %ld: COM: %ld, ACT: %d, SUM: %ld P: %0.1f D: %0.1f I: %0.1f PWM: %d ", (long)PID[servoID].Time, (long)PID[servoID].CommandPos, PID[servoID].ActualPos, PID[servoID].sumError, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
             // printf("\rCOM: %ld, ACT: %ld, ERR: %ld SUM: %ld PWM: %d", PID[servoID].CommandPos, PID[servoID].ActualPos, Error, PID[servoID].sumError, PID[servoID].PWMvalue);
         }
     }         
