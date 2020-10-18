@@ -80,13 +80,14 @@ unsigned short CalculateModbusCRC(unsigned char *input_str, short num_bytes)
 // Compare the result with the two byte CRC at the end of the packet.
 // If there is a match, then process the packet.
 // If no match, quit without transmitting anything.
-unsigned char CheckCRC (unsigned char *ptrPacketData, short packetLength)
+unsigned char CheckCRC (unsigned char *ptrPacketData, short dataLength)
 {
 unsigned short CRCincoming, CRCcheck;
-    Cconvert.b[0] = ptrPacketData[packetLength-2];
-    Cconvert.b[1] = ptrPacketData[packetLength-1];
+    Cconvert.b[0] = ptrPacketData[dataLength];
+    Cconvert.b[1] = ptrPacketData[dataLength+1];
     CRCincoming = Cconvert.integer;    
-    CRCcheck = CalculateModbusCRC(ptrPacketData, packetLength-2);
+    CRCcheck = CalculateModbusCRC(ptrPacketData, dataLength);
+    // printf("\rPack length: %d bytes, CRC IN: %d, CRC CHECK: %d", dataLength, CRCincoming, CRCcheck);    
     if (CRCcheck != CRCincoming) return false;
     else return true;
 }
