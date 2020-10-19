@@ -27,6 +27,8 @@
  * 10-18-20:Constant velocity mode is working nicely using Encoder inputs on ServoCity 26:1 motors.
  *          Got forward/backward/right/left working with joystick on XBEE input.
  *          Re-enabled POT mode for servo #0.
+ * 10-29-20:Made adjustments to joystick to work with large motors 
+ *          and loads for complementary wheelchair wheels.
  ***********************************************************************************/
 
 enum {
@@ -36,7 +38,7 @@ enum {
 };
 
 // #define USE_FEATHER_BOARD
-// #define ACCELERATION 0.01
+#define ACCELERATION 0.1
 #define DEFAULT_MODE CONTINUOUS_MODE
 #define USE_PID
 #define SUCCESS 0
@@ -57,7 +59,7 @@ enum {
 #define KK_PWM_OFFSET 100
 #define KKP 8.0
 #define KKI 0.04
-#define KKD 8.0 // 30
+#define KKD 1000.0 // 30
 
 #define MAX_COMMAND_COUNTS 850
 #define MIN_COMMAND_COUNTS 100
@@ -74,7 +76,7 @@ enum {
 #define MAXSUM 500000
 #define PWM_MAX 4000
 
-#define FILTERSIZE 10  // Was 4
+#define FILTERSIZE 32  // Was 4
 
 #include <xc.h>
 #include "Delay.h"
@@ -194,14 +196,15 @@ struct PIDtype
     float kP;
     float kI;
     float kD;
-    short PWMoffset;
-    short PWMvalue;
+    long PWMoffset;
+    long PWMvalue;
     short ADActual;    
     long  Destination;
     float  CommandPos;    
     long ActualPos;
     float Velocity;
-    // float TargetVelocity;        
+    float TargetVelocity;
+    float ActualVelocity[FILTERSIZE];
     short ADCommand;
     short ErrorCounter;
     unsigned char saturation;
@@ -329,7 +332,8 @@ int main(void)
     short ServoPositions[MAXSERVOS] = {512,512,512,512};    
     unsigned char ch, command, subCommand, outPacket[MAXBUFFER];
     short numDataIntegers, outData[MAXBUFFER], packetLength;      
-    short PreviousXBEEData = -9999;
+    short PreviousXBEEData1 = -9999, PreviousXBEEData2 = -9999;
+    
     unsigned char CRCerror = false;    
     
     InitPID();     
@@ -356,6 +360,8 @@ int main(void)
     else if (runState==REMOTE) printf("RunMode = REMOTE");
     else if (runState==JOG) printf("RunMode = JOG");
     else printf("RunMode = STANDBY");    
+    
+    printf("\rComplementary wheelchair motors on Servos #2 and #3");
 #else
     printf("\r\rSERVOS Disabled\r");    
     if (runState==LOCAL) printf("RunMode = LOCAL");
@@ -420,14 +426,38 @@ int main(void)
         {            
             if ( processPacketData(XBEEPacketLength, XBEEPacket, &numDataIntegers, XBEEData, &command, &subCommand))
             {
-                //if (abs(PreviousXBEEData - XBEEData[1]) > 2)
+                // if ( abs(PreviousXBEEData1 - XBEEData[1]) > 2 || abs(PreviousXBEEData2 - XBEEData[2]) > 2)
                 {
-                    PreviousXBEEData = XBEEData[1];                    
+                    PreviousXBEEData1 = XBEEData[1];
+                    PreviousXBEEData2 = XBEEData[2];
                     //printf("\r> XBEE length: %d, int #1: %d, int #2: %d, com: %X, sub: %X, numData: %d", XBEEPacketLength, XBEEData[0], XBEEData[1], command, subCommand, numDataIntegers);
                     ForwardReverse = (float) XBEEData[1];
+                    #define DEADZONE 10
+                    if (ForwardReverse > 0)
+                    {
+                        ForwardReverse = ForwardReverse - DEADZONE;
+                        if (ForwardReverse < 0) ForwardReverse = 0;
+                    }
+                    else if (ForwardReverse < 0)
+                    {
+                        ForwardReverse = ForwardReverse + DEADZONE;
+                        if (ForwardReverse > 0) ForwardReverse = 0;
+                    }
+                    
                     RightLeft = (float) XBEEData[0] ;
-                    PID[2].Velocity = (ForwardReverse + RightLeft) / 400;
-                    PID[3].Velocity = (ForwardReverse - RightLeft) / 400;
+                    if (RightLeft > 0)
+                    {
+                        RightLeft = RightLeft - DEADZONE;
+                        if (RightLeft < 0) RightLeft = 0;
+                    }
+                    else if (RightLeft < 0)
+                    {
+                        RightLeft = RightLeft + DEADZONE;
+                        if (RightLeft > 0) RightLeft = 0;
+                    }
+                    
+                    PID[2].TargetVelocity = (RightLeft + ForwardReverse) / 10;
+                    PID[3].TargetVelocity = (RightLeft - ForwardReverse) / 10;
                     //printf("\r>XBEE: %d, %d, Velocity: %0.3f, %0.3f", XBEEData[0], XBEEData[1], PID[2].Velocity, PID[3].Velocity);
                 }
             }
@@ -504,7 +534,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;                            
                         }
                         else MOTOR_DIR1 = FORWARD;                                    
-                        PWM1 = PWMvalue;
+                        PWM1 = (unsigned short)PWMvalue;
                         
                     }       
                     else if (i == 1)
@@ -515,7 +545,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR2 = FORWARD;
-                        PWM2 = PWMvalue;
+                        PWM2 = (unsigned short)PWMvalue;
                     }                                                
                     else if (i == 2) 
                     {
@@ -524,8 +554,8 @@ int main(void)
                             MOTOR_DIR3 = REVERSE;                    
                             PWMvalue = 0 - PWMvalue;
                         }
-                        else MOTOR_DIR3 = FORWARD;                            
-                        PWM3 = PWMvalue;
+                        else MOTOR_DIR3 = FORWARD;                                                    
+                        PWM3 = (unsigned short)PWMvalue;
                     }
                     else if (i == 3)  // Motor #4
                     {
@@ -535,7 +565,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR4 = FORWARD;          
-                        PWM4 = PWMvalue;
+                        PWM4 = (unsigned short)PWMvalue;
                     }
                     else
                     {
@@ -545,7 +575,7 @@ int main(void)
                             PWMvalue = 0 - PWMvalue;
                         }
                         else MOTOR_DIR5 = FORWARD;                            
-                        PWM5 = PWMvalue;
+                        PWM5 = (unsigned short)PWMvalue;
                     }
                     
                 }                                                
@@ -1548,7 +1578,7 @@ void InitPID()
         PID[i].quadCurrent = QUAD_NONE;
         PID[i].quadPrevious = QUAD_NONE;        
         PID[i].Mode = 0;
-        //PID[i].TargetVelocity = 0;
+        PID[i].TargetVelocity = 0;
         
         
         if (i == 2 || i == 3)
@@ -1572,164 +1602,6 @@ void InitPID()
     }
 }
 
-long ENCODERcontrol(long servoID, struct PIDtype *PID)
-{
-    long Error;         
-    long totalDerError = 0;
-    long derError;    
-    long lngCommandPos = 0;    
-    float PCorr = 0, ICorr = 0, DCorr = 0;    
-    unsigned char EncoderDirection;
-    static short displayCounter = 0;
-    short i;    
-    
-    if (PID[servoID].Halted)
-    {
-        PID[servoID].PWMvalue = 0;
-        return 0;
-    }
-
-    PID[servoID].CommandPos = PID[servoID].CommandPos + PID[servoID].Velocity;
-    lngCommandPos = (long) PID[servoID].CommandPos;
-    
-/*    
-    if (PID[servoID].Velocity < PID[servoID].TargetVelocity) 
-    {
-        PID[servoID].Velocity = PID[servoID].Velocity + ACCELERATION;
-        if (PID[servoID].Velocity > PID[servoID].TargetVelocity)
-            PID[servoID].Velocity = PID[servoID].TargetVelocity;
-    }
-    else if (PID[servoID].Velocity > PID[servoID].TargetVelocity)
-    {
-        PID[servoID].Velocity = PID[servoID].Velocity - ACCELERATION;
-        if (PID[servoID].Velocity < PID[servoID].TargetVelocity)
-            PID[servoID].Velocity = PID[servoID].TargetVelocity;        
-    }
-*/
-    
-    if (PID[servoID].Mode == DESTINATION_MODE)
-    {
-        if (PID[servoID].Velocity > (float)0.0 && PID[servoID].CommandPos > PID[servoID].Destination)
-                PID[servoID].CommandPos = PID[servoID].Destination;
-        else if (PID[servoID].Velocity < (float)0.0 && PID[servoID].CommandPos < PID[servoID].Destination)
-                PID[servoID].CommandPos = PID[servoID].Destination;
-    }    
-    
-    if (servoID == 1)
-    {
-        EncoderDirection = !EncoderOneDir;
-        if (EncoderDirection) PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderOne;
-        else PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderOne;
-        EncoderOne = 0;
-    }    
-    else if (servoID == 2)
-    {
-        EncoderDirection = !EncoderTwoDir;
-        if (EncoderDirection) PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderTwo;
-        else PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderTwo;
-        EncoderTwo = 0;
-    }    
-    else if (servoID == 3)
-    {
-        EncoderDirection = !EncoderThreeDir;
-        if (EncoderDirection) PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderThree;
-        else PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderThree;
-        EncoderThree = 0;
-    }    
-    else if (servoID == 4)
-    {
-        EncoderDirection = !EncoderFourDir;
-        if (EncoderDirection) PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderFour;
-        else PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderFour;
-        EncoderFour = 0;
-    }        
-    
-    if (PID[servoID].Mode == DESTINATION_MODE)
-    {
-        if (PID[servoID].Destination >= 0) 
-        {
-            if (PID[servoID].ActualPos >= (long)(PID[servoID].Destination)) 
-            {
-                printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
-                PID[servoID].Halted = true;
-                return 0;
-            }
-        }
-        else
-        {
-            if (PID[servoID].ActualPos <= (long)(PID[servoID].Destination))
-            {
-                printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
-                PID[servoID].Halted = true;
-                return 0;
-            }            
-        }
-    }
-    
-    Error = PID[servoID].ActualPos - lngCommandPos;
-    // derError = Error - PID[servoID].error[errIndex];
-    PID[servoID].error[errIndex] = Error;                
-         
-    if (!PID[servoID].saturation) PID[servoID].sumError = PID[servoID].sumError + (long)Error; 
-        
-    totalDerError = 0;
-    for (i = 0; i < FILTERSIZE; i++)
-        totalDerError = totalDerError + PID[servoID].error[i];
-    
-    derError = totalDerError / FILTERSIZE;        
-    
-    if (PID[servoID].sumError > MAXSUM) PID[servoID].sumError = MAXSUM;
-    if (PID[servoID].sumError < -MAXSUM) PID[servoID].sumError = -MAXSUM;        
-    
-    PCorr = ((float)Error) * -PID[servoID].kP;    
-    ICorr = ((float)PID[servoID].sumError)  * -PID[servoID].kI;
-    DCorr = ((float)derError) * -PID[servoID].kD;
-
-    float PIDcorrection = PCorr + ICorr + DCorr;
-    
-    if (PIDcorrection == 0) PID[servoID].PWMvalue = 0;
-    else if (PIDcorrection < 0) PID[servoID].PWMvalue = (long) (PIDcorrection - PID[servoID].PWMoffset);            
-    else PID[servoID].PWMvalue = (long) (PIDcorrection + PID[servoID].PWMoffset);                    
-           
-        
-    if (PID[servoID].PWMvalue > PWM_MAX) 
-    {
-        PID[servoID].PWMvalue = PWM_MAX;
-        PID[servoID].saturation = true;
-    }
-    else if (PID[servoID].PWMvalue < -PWM_MAX) 
-    {
-        PID[servoID].PWMvalue = -PWM_MAX;
-        PID[servoID].saturation = true;
-    }
-    else PID[servoID].saturation = false;
-    
-    
-    if (PID[servoID].PWMvalue > PWM_MAX) 
-    {
-        PID[servoID].PWMvalue = PWM_MAX;
-        PID[servoID].saturation = true;
-    }
-    else if (PID[servoID].PWMvalue < -PWM_MAX) 
-    {
-        PID[servoID].PWMvalue = -PWM_MAX;
-        PID[servoID].saturation = true;
-    }
-    else PID[servoID].saturation = false;        
-    
-    /*
-    if (servoID == 3)
-    {
-        displayCounter++;
-        if (displayCounter >= 20 && displayFlag)
-        {
-            displayCounter = 0;            
-            printf("\r>COM: %0.0f, ACT: %ld, ERR: %ld P: %0.1f I: %0.1f D: %0.1f PWM: %d ", PID[servoID].CommandPos, PID[servoID].ActualPos, Error, PCorr, ICorr, DCorr, PID[servoID].PWMvalue);
-        }
-    }       
-    */
-    return 1;
-}
 
 long POTcontrol(long servoID, struct PIDtype *PID)
 {
@@ -1815,6 +1687,7 @@ long POTcontrol(long servoID, struct PIDtype *PID)
         sensorError = true;
     }        
     
+    /*
     displayCounter++;
     if (servoID == 0 && displayFlag)
     {
@@ -1825,7 +1698,7 @@ long POTcontrol(long servoID, struct PIDtype *PID)
             else printf("\rCOM: %d ACT: %d ERR: %d SUM: %d P: %0.1f D: %0.1f I: %0.1f PWM: %d ", commandPosition, actualPosition, Error, PID[servoID].sumError, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
         }
     }
-
+    */
     return 1;
 }
 
@@ -1908,4 +1781,187 @@ int ADC10_ManualInit(void)
     AD1CON1bits.ASAM = 1;        // Start Automatic Sampling. 
     AD1CON1bits.ON = 1;            // Turn on ADC.
     return (1);
+}
+
+long ENCODERcontrol(long servoID, struct PIDtype *PID)
+{
+    long Error;         
+    long lngCommandPos = 0;    
+    float PCorr = 0, ICorr = 0, DCorr = 0;    
+    unsigned char EncoderDirection;
+    static short displayCounter = 0;
+    short i;    
+    float ActualVelocity, AverageVelocity, ErrorVelocity;
+    
+    if (PID[servoID].Halted)
+    {
+        PID[servoID].PWMvalue = 0;
+        return 0;
+    }
+
+    if (servoID == 0)
+    {
+        PID[servoID].Halted = true;
+        PID[servoID].PWMvalue = 0;
+        return 0;
+    }
+            
+    lngCommandPos = (long) PID[servoID].CommandPos;    
+        
+    if (PID[servoID].Velocity < PID[servoID].TargetVelocity) 
+    {
+        PID[servoID].Velocity = PID[servoID].Velocity + ACCELERATION;
+        if (PID[servoID].Velocity > PID[servoID].TargetVelocity)
+            PID[servoID].Velocity = PID[servoID].TargetVelocity;
+    }
+    else if (PID[servoID].Velocity > PID[servoID].TargetVelocity)
+    {
+        PID[servoID].Velocity = PID[servoID].Velocity - ACCELERATION;
+        if (PID[servoID].Velocity < PID[servoID].TargetVelocity)
+            PID[servoID].Velocity = PID[servoID].TargetVelocity;        
+    }
+           
+    if (!PID[servoID].saturation) PID[servoID].CommandPos = PID[servoID].CommandPos + PID[servoID].Velocity;    
+    
+    if (PID[servoID].Mode == DESTINATION_MODE)
+    {
+        if (PID[servoID].Velocity > (float)0.0 && PID[servoID].CommandPos > PID[servoID].Destination)
+                PID[servoID].CommandPos = PID[servoID].Destination;
+        else if (PID[servoID].Velocity < (float)0.0 && PID[servoID].CommandPos < PID[servoID].Destination)
+                PID[servoID].CommandPos = PID[servoID].Destination;
+    }    
+    
+    if (servoID == 1)
+    {
+        EncoderDirection = !EncoderOneDir;        
+        if (EncoderDirection) 
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderOne;
+            ActualVelocity = (float) EncoderOne;
+        }
+        else
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderOne;
+            ActualVelocity = (float) 0 - EncoderOne;
+        }
+        EncoderOne = 0;
+    }    
+    else if (servoID == 2)
+    {
+        EncoderDirection = EncoderTwoDir;
+        if (EncoderDirection) 
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderTwo;
+            ActualVelocity = (float) EncoderTwo;
+        }
+        else
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderTwo;
+            ActualVelocity = (float) 0 - EncoderTwo;
+        }
+        EncoderTwo = 0;
+    }    
+    else if (servoID == 3)
+    {
+        EncoderDirection = EncoderThreeDir;
+        if (EncoderDirection) 
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderThree;
+            ActualVelocity = (float) EncoderThree;
+        }
+        else
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderThree;
+            ActualVelocity = (float) 0 - EncoderThree;
+        }
+        EncoderThree = 0;
+    }    
+    else if (servoID == 4)
+    {
+        EncoderDirection = !EncoderFourDir;
+        if (EncoderDirection) 
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos + (long)EncoderFour;
+            ActualVelocity = (float) EncoderFour;
+        }
+        else
+        {
+            PID[servoID].ActualPos = PID[servoID].ActualPos - (long)EncoderFour;
+            ActualVelocity = (float) 0 - EncoderFour;
+        }
+        EncoderFour = 0;
+    }    
+    
+    if (PID[servoID].Mode == DESTINATION_MODE)
+    {
+        if (PID[servoID].Destination >= 0) 
+        {
+            if (PID[servoID].ActualPos >= (long)(PID[servoID].Destination)) 
+            {
+                printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
+                PID[servoID].Halted = true;
+                return 0;
+            }
+        }
+        else
+        {
+            if (PID[servoID].ActualPos <= (long)(PID[servoID].Destination))
+            {
+                printf("\rHALTED: COM: %ld, ACT: %ld", (long)(PID[servoID].CommandPos), PID[servoID].ActualPos);
+                PID[servoID].Halted = true;
+                return 0;
+            }            
+        }
+    }
+    
+    Error = PID[servoID].ActualPos - lngCommandPos;
+         
+    if (!PID[servoID].saturation) PID[servoID].sumError = PID[servoID].sumError + (long)Error; 
+
+    // derError = Error - PID[servoID].error[errIndex];
+    PID[servoID].ActualVelocity[errIndex] = ActualVelocity;    
+    AverageVelocity = 0;
+    for (i = 0; i < FILTERSIZE; i++)
+        AverageVelocity = AverageVelocity + PID[servoID].ActualVelocity[i];
+    
+    AverageVelocity = AverageVelocity / FILTERSIZE;        
+    
+    if (PID[servoID].sumError > MAXSUM) PID[servoID].sumError = MAXSUM;
+    if (PID[servoID].sumError < -MAXSUM) PID[servoID].sumError = -MAXSUM;        
+    
+    PCorr = ((float)Error) * -PID[servoID].kP;    
+    ICorr = ((float)PID[servoID].sumError)  * -PID[servoID].kI;
+    DCorr = (AverageVelocity - PID[servoID].Velocity) * -PID[servoID].kD;
+
+    float PIDcorrection = PCorr + ICorr + DCorr;
+    
+    if (PIDcorrection == 0) PID[servoID].PWMvalue = 0;
+    else if (PIDcorrection < 0) PID[servoID].PWMvalue = (long) (PIDcorrection - PID[servoID].PWMoffset);            
+    else PID[servoID].PWMvalue = (long) (PIDcorrection + PID[servoID].PWMoffset);                    
+           
+        
+    if (PID[servoID].PWMvalue >= PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else if (PID[servoID].PWMvalue <= -PWM_MAX) 
+    {
+        PID[servoID].PWMvalue = -PWM_MAX;
+        PID[servoID].saturation = true;
+    }
+    else PID[servoID].saturation = false;
+    
+    if (servoID == 2)
+    {
+        displayCounter++;
+        if (displayCounter >= 20 && displayFlag)
+        {
+            displayCounter = 0;         
+            // printf("\r>COM: %0.0f, ACT: %ld, ERR: %ld P: %0.1f I: %0.1f D: %0.1f PWM: %d ", PID[servoID].CommandPos, PID[servoID].ActualPos, Error, PCorr, ICorr, DCorr, PID[servoID].PWMvalue);
+            printf("\r>VEL: %0.1f COM: %0.0f, ERR: %ld P: %0.1f I: %0.1f D: %0.1f PWM: %d ", PID[servoID].Velocity, PID[servoID].CommandPos, Error, PCorr, ICorr, DCorr, PID[servoID].PWMvalue);            
+        }
+    }       
+    
+    return 1;
 }
