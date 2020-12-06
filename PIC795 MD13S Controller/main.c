@@ -30,6 +30,9 @@
  * 10-19-20:Made adjustments to joystick to work with large motors 
  *          and loads for complementary wheelchair wheels.
  * 10-20-20:Added Watchdog timer. Cleaned up POT control mode, fixed bug. Motor can now go well beyond 360 degrees.
+ * 11-14-20: 
+ * 12-6-20: Modified to receive MIDI device data on XBEE at 57600 baud and control first servo with it.
+ *          So now it works with MIDI_Device recording and playing back one servo motor.
  ***********************************************************************************/
 
 enum {
@@ -64,8 +67,8 @@ enum {
 #define KKI 0.04
 #define KKD 1000.0 // 30
 
-#define MAX_COMMAND_COUNTS 855 // 840 // 837.8
-#define MIN_COMMAND_COUNTS 94// 93// 100 // 93.1
+#define MAX_COMMAND_COUNTS 856 // 869
+#define MIN_COMMAND_COUNTS 91  // 86
 
 #define	STX '>'
 #define	DLE '/'
@@ -265,9 +268,10 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
 unsigned char SendReceiveSPI(unsigned char dataOut);
 void ResetPID();
 void InitPID();
-long POTcontrol(long servoID, struct PIDtype *PID);
+long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos);
 long ENCODERcontrol(long servoID, struct PIDtype *PID);
 unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, short *numData, short *ptrData, unsigned char *command, unsigned char *subCommand);
+short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength);
 
 unsigned char DATABufferFull = false;
 // void ClearCopyBuffer();
@@ -292,7 +296,7 @@ enum
 };
 
 short time, seconds = 0, minutes = 0, hundredths = 0;
-unsigned char TestMode = false;
+// unsigned char TestMode = false;
 unsigned short ADresult[MAXPOTS];
 unsigned short SWRead = 0;
 unsigned char SWChangeFlag = false;
@@ -317,7 +321,7 @@ int main(void)
     unsigned char MessageIn[64] = "";
     unsigned ADdisplay = true;    
     short SWcounter = 0;    
-    unsigned char runMode = REMOTE;
+    unsigned char runMode = LOCAL;
     short startAddress = 0x0000;
     #define NUM_RC_SERVOS 4
     short RCservoPos[NUM_RC_SERVOS] = {0,0,0,0};
@@ -330,10 +334,10 @@ int main(void)
     short numServos;
     short ServoPositions[MAXSERVOS] = {512,512,512,512};    
     unsigned char ch, command, subCommand, outPacket[MAXBUFFER];
-    short numDataIntegers, outData[MAXBUFFER], packetLength;      
-    short PreviousXBEEData1 = -9999, PreviousXBEEData2 = -9999;
-    
+    short numDataIntegers, outData[MAXBUFFER], packetLength;          
+    short peakCounts = 0, minCounts = 1023, ADcounts = 0;    
     unsigned char CRCerror = false;    
+    short packetCounter = 0;
     
     InitPID();     
     DelayMs(10);
@@ -342,6 +346,7 @@ int main(void)
     
     DelayMs(100);
     
+    printf("\r\rTESTING MD13S SERVO CONTROLLER with XBEE MIDI IN #1");
     
 #ifdef USE_FEATHER_BOARD
     printf("\rInitializing Feather Servo Board at address 0x80: ");
@@ -349,11 +354,11 @@ int main(void)
     else printf(" ERROR");    
 }
 #endif
-    
+
 #ifdef USE_PID    
-    if (DEFAULT_MODE == POT_MODE) printf("\r\rDefault mode: POT MODE\r");    
-    else if (DEFAULT_MODE == DESTINATION_MODE) printf("\r\rDefault mode: DESTINATION\r");
-    else printf("\r\rDefault mode: CONTINUOUS\r");
+    if (DEFAULT_MODE == POT_MODE) printf("\rDefault mode: POT MODE\r");    
+    else if (DEFAULT_MODE == DESTINATION_MODE) printf("\rDefault mode: DESTINATION\r");
+    else printf("\rDefault mode: CONTINUOUS\r");
         
     if (runState==LOCAL) printf("RunMode = LOCAL");
     else if (runState==REMOTE) printf("RunMode = REMOTE");
@@ -380,8 +385,8 @@ int main(void)
     printf("\rMessage: %s", MessageIn);
 #endif
     
-    // printf("\rTesting DMA Rx and Tx on RS485");
-    printf("\rTESTING SERVO #1...");
+    //printf("\rTesting DMA Rx and Tx on RS485");
+    
     while(1) 
     {   
         ClrWdt(); // CLEAR_WATCHDOG
@@ -420,9 +425,8 @@ int main(void)
             else PrintServoData(numServos, ServoPositions, command, subCommand);                                    
             ClearCopyBuffer();
         }        
-        */
+        */        
         
-        /*
         if (flagRemoteTimeout)
         {
             PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
@@ -431,7 +435,7 @@ int main(void)
             ResetPID();
             runState = HALTED;
         }
-        */
+        
         
         if (XBEEPacketLength)   // $$$$
         {            
@@ -440,42 +444,36 @@ int main(void)
                 timeout = 5000;
                 if (!runState) printf("\rState = REMOTE RUN");
                 runState = runMode = REMOTE;
-                // if ( abs(PreviousXBEEData1 - XBEEData[1]) > 2 || abs(PreviousXBEEData2 - XBEEData[2]) > 2)
+                printf("\r#%d: Packet length %d: %d, %d, %d, %d", packetCounter++, XBEEPacketLength, XBEEData[0], XBEEData[1], XBEEData[2], XBEEData[3]);
+                
+                /*
+                ForwardReverse = (float) XBEEData[1];                    
+                if (ForwardReverse > 0)
                 {
-                    PreviousXBEEData1 = XBEEData[1];
-                    PreviousXBEEData2 = XBEEData[2];
-                    //printf("\r> XBEE length: %d, int #1: %d, int #2: %d, com: %X, sub: %X, numData: %d", XBEEPacketLength, XBEEData[0], XBEEData[1], command, subCommand, numDataIntegers);
-                    ForwardReverse = (float) XBEEData[1];
-                    
-                    if (ForwardReverse > 0)
-                    {
-                        ForwardReverse = ForwardReverse - DEADZONE;
-                        if (ForwardReverse < 0) ForwardReverse = 0;
-                    }
-                    else if (ForwardReverse < 0)
-                    {
-                        ForwardReverse = ForwardReverse + DEADZONE;
-                        if (ForwardReverse > 0) ForwardReverse = 0;
-                    }
-                    
-                    RightLeft = (float) XBEEData[0];
-                    if (RightLeft > 0)
-                    {
-                        RightLeft = RightLeft - DEADZONE;
-                        if (RightLeft < 0) RightLeft = 0;
-                    }
-                    else if (RightLeft < 0)
-                    {
-                        RightLeft = RightLeft + DEADZONE;
-                        if (RightLeft > 0) RightLeft = 0;
-                    }
-                    
-                    PID[2].TargetVelocity = (RightLeft + ForwardReverse) / 10;
-                    PID[3].TargetVelocity = (RightLeft - ForwardReverse) / 10;
-                    //printf("\r>XBEE: %d, %d, Velocity: %0.3f, %0.3f", XBEEData[0], XBEEData[1], PID[2].Velocity, PID[3].Velocity);
+                    ForwardReverse = ForwardReverse - DEADZONE;
+                    if (ForwardReverse < 0) ForwardReverse = 0;
                 }
+                else if (ForwardReverse < 0)
+                {
+                    ForwardReverse = ForwardReverse + DEADZONE;
+                    if (ForwardReverse > 0) ForwardReverse = 0;
+                }
+                    
+                RightLeft = (float) XBEEData[0];
+                if (RightLeft > 0)
+                {
+                    RightLeft = RightLeft - DEADZONE;
+                    if (RightLeft < 0) RightLeft = 0;
+                }
+                else if (RightLeft < 0)
+                {
+                    RightLeft = RightLeft + DEADZONE;
+                    if (RightLeft > 0) RightLeft = 0;
+                }                    
+                PID[2].TargetVelocity = (RightLeft + ForwardReverse) / 10;
+                PID[3].TargetVelocity = (RightLeft - ForwardReverse) / 10;
+                */
             }
-            //else printf("\rERR> XBEE length: %d, int #1: %d, int #2: %d, com: %X, sub: %X, numData: %d", XBEEPacketLength, XBEEData[0], XBEEData[1], command, subCommand, numDataIntegers);
             XBEEPacketLength = 0;
         }        
 
@@ -495,6 +493,10 @@ int main(void)
                 for (i = 0; i < MAXPOTS; i++)
                     ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
                 AD1CON1bits.ASAM = 1;        // Restart sampling.
+                //ADcounts = ADresult[2];
+                //if (ADcounts < minCounts) minCounts = ADcounts;
+                //if (ADcounts > peakCounts) peakCounts = ADcounts;
+                //printf("\r%d, min: %d, max: %d", ADresult[2], minCounts, peakCounts);
             }
             
             if (runState)
@@ -534,7 +536,10 @@ int main(void)
                         if (!PID[i].Halted)
                         {
                             if (PID[i].Mode == POT_MODE) 
-                                POTcontrol(i, PID);
+                            {
+                                if (runState == LOCAL) POTcontrol(i, PID, ADresult[i+6]);
+                                else POTcontrol(i, PID, XBEEData[i+1]);
+                            }
                             else ENCODERcontrol(i, PID);                        
                             PWMvalue = PID[i].PWMvalue;
                         }
@@ -550,8 +555,7 @@ int main(void)
                         else MOTOR_DIR1 = FORWARD;                                    
                         PWM1 = (unsigned short)PWMvalue;
                         
-                    }    
-                    /*
+                    }                        
                     else if (i == 1)
                     {
                         if (PWMvalue < 0)
@@ -591,9 +595,7 @@ int main(void)
                         }
                         else MOTOR_DIR5 = FORWARD;                            
                         PWM5 = (unsigned short)PWMvalue;
-                    }
-                    */
-                    PWM2 = PWM3 = PWM4 = PWM5 = 0;
+                    }                    
                 }                                                
                 errIndex++; 
                 if (errIndex >= FILTERSIZE) errIndex = 0;
@@ -1874,7 +1876,7 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
     return 1;
 }
 
-long POTcontrol(long servoID, struct PIDtype *PID)
+long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos)
 {
     short Error;     
     short actualPosition;
@@ -1885,7 +1887,7 @@ long POTcontrol(long servoID, struct PIDtype *PID)
     short i;
     static short displayCounter = 0;       
     
-    PID[servoID].ADCommand = (short)(ADresult[servoID+6]);
+    PID[servoID].ADCommand = CommandPos; // (short)(ADresult[servoID+6]);
     PID[servoID].ADActual = (short)(ADresult[servoID+1]);
     
     /*
@@ -1948,4 +1950,57 @@ long POTcontrol(long servoID, struct PIDtype *PID)
             }
         }
     return 1;
+}
+
+short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength)
+{
+	int i, j;
+    unsigned char arrOutputBytes[64];
+	short packetIndex = 0, numBytes = 0;
+    unsigned char dataByte;    
+    
+    union
+    {
+        unsigned char b[2];
+        unsigned short integer;
+    } convert;	
+
+	j = 0;
+	// Header first
+	arrOutputBytes[j++] = command;
+	arrOutputBytes[j++] = subcommand;
+	arrOutputBytes[j++] = numData;
+
+	// Convert integer data to unsigned chars    
+	for (i = 0; i < numData; i++)
+	{
+		convert.integer = ptrData[i];
+		arrOutputBytes[j++] = convert.b[0];
+		arrOutputBytes[j++] = convert.b[1];
+	}
+
+	convert.integer = CalculateModbusCRC(arrOutputBytes, j);      
+    
+	arrOutputBytes[j++] = convert.b[0];
+	arrOutputBytes[j++] = convert.b[1];
+	numBytes = j;
+
+	if (numBytes <= (MAXBUFFER + 16))
+	{
+        packetIndex = 0;
+		ptrPacket[packetIndex++] = STX;
+		for (i = 0; i < numBytes; i++)
+		{
+			dataByte = arrOutputBytes[i];
+			if (dataByte == STX || dataByte == DLE || dataByte == ETX)
+				ptrPacket[packetIndex++] = DLE;
+			if (packetIndex >= MAXBUFFER) return 0;
+			if (dataByte == ETX) dataByte = ETX - 1;
+			ptrPacket[packetIndex++] = dataByte;
+		}
+		ptrPacket[packetIndex++] = ETX;
+		*packetLength = packetIndex;
+		return (packetIndex);
+	}
+	else return 0;
 }
