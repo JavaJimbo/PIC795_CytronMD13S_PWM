@@ -6,33 +6,34 @@
  * For Robotnik MD13S Controller Board Rev 1.0
  * Adapted from Robotnik_Brain_Board
  * 
- * 8-13-20: Set up IO for new board
- * 9-13-20: Created ADC10_ManualInit()
- * 9-14-20: Fixed ADC bug. Polling works great now.
- * 9-15-20: Got all five PWMs working, also four SW inputs with interrupt on change,
- *          also four encoder counters and encoder direction inputs.
- *          Created USE_PID mode and tested PID with one motor.
- *          Fixed a few PID bugs - works better, and doesn't overrun and go wild.
- *          Added previousPosition, quadCurrent, quadPrevious to PIDtype struct.
- *          Enabled PID for all five motors.
- * 9-16-20: Got DMA working with RS485 Rx at 981600 baud.
- * 9-20-20: Got RC Feather servo board working.
+ * 8-13-20:     Set up IO for new board
+ * 9-13-20:     Created ADC10_ManualInit()
+ * 9-14-20:     Fixed ADC bug. Polling works great now.
+ * 9-15-20:     Got all five PWMs working, also four SW inputs with interrupt on change,
+ *              also four encoder counters and encoder direction inputs.
+ *              Created USE_PID mode and tested PID with one motor.
+ *              Fixed a few PID bugs - works better, and doesn't overrun and go wild.
+ *              Added previousPosition, quadCurrent, quadPrevious to PIDtype struct.
+ *              Enabled PID for all five motors.
+ * 9-16-20:     Got DMA working with RS485 Rx at 981600 baud.
+ * 9-20-20:     Got RC Feather servo board working.
  * 9-21-20: 
- * 9-22-20: Got encoders working nicely in Destination mode - enter positions by text.
- * 9-23-20: Eliminated Velocity mode for now.
- * 9-29-20: Testing RC servo motors with Feather board. Baudrate: 115200
- * 10-2-20: Four RC servos working with pots controlling Feather board.
- * 10-3-20: Added Velocity variable to limit speed.
- * 10-17-20:Got CRC working. 
- * 10-18-20:Constant velocity mode is working nicely using Encoder inputs on ServoCity 26:1 motors.
- *          Got forward/backward/right/left working with joystick on XBEE input.
- *          Re-enabled POT mode for servo #0.
- * 10-19-20:Made adjustments to joystick to work with large motors 
- *          and loads for complementary wheelchair wheels.
- * 10-20-20:Added Watchdog timer. Cleaned up POT control mode, fixed bug. Motor can now go well beyond 360 degrees.
+ * 9-22-20:     Got encoders working nicely in Destination mode - enter positions by text.
+ * 9-23-20:     Eliminated Velocity mode for now.
+ * 9-29-20:     Testing RC servo motors with Feather board. Baudrate: 115200
+ * 10-2-20:     Four RC servos working with pots controlling Feather board.
+ * 10-3-20:     Added Velocity variable to limit speed.
+ * 10-17-20:    Got CRC working. 
+ * 10-18-20:    Constant velocity mode is working nicely using Encoder inputs on ServoCity 26:1 motors.
+ *              Got forward/backward/right/left working with joystick on XBEE input.
+ *              Re-enabled POT mode for servo #0.
+ * 10-19-20:    Made adjustments to joystick to work with large motors 
+ *              and loads for complementary wheelchair wheels.
+ * 10-20-20:    Added Watchdog timer. Cleaned up POT control mode, fixed bug. Motor can now go well beyond 360 degrees.
  * 11-14-20: 
- * 12-6-20: Modified to receive MIDI device data on XBEE at 57600 baud and control first servo with it.
- *          So now it works with MIDI_Device recording and playing back one servo motor.
+ * 12-6-20:     Modified to receive MIDI device data on XBEE at 57600 baud and control first servo with it.
+ *              So now it works with MIDI_Device recording and playing back one servo motor.
+ * 12-16-20:    Works now with multiple sevos recording and playing back on ProTools.
  ***********************************************************************************/
 
 enum {
@@ -268,10 +269,10 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
 unsigned char SendReceiveSPI(unsigned char dataOut);
 void ResetPID();
 void InitPID();
-long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos);
+long POTcontrol(long servoID, struct PIDtype *PID);
 long ENCODERcontrol(long servoID, struct PIDtype *PID);
 unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, short *numData, short *ptrData, unsigned char *command, unsigned char *subCommand);
-short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength);
+// short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength);
 
 unsigned char DATABufferFull = false;
 // void ClearCopyBuffer();
@@ -347,6 +348,7 @@ int main(void)
     DelayMs(100);
     
     printf("\r\rTESTING MD13S SERVO CONTROLLER with XBEE MIDI IN #1");
+    printf("\rRemote timeouts disabled");
     
 #ifdef USE_FEATHER_BOARD
     printf("\rInitializing Feather Servo Board at address 0x80: ");
@@ -356,6 +358,9 @@ int main(void)
 #endif
 
 #ifdef USE_PID    
+
+    runState = runMode;
+
     if (DEFAULT_MODE == POT_MODE) printf("\rDefault mode: POT MODE\r");    
     else if (DEFAULT_MODE == DESTINATION_MODE) printf("\rDefault mode: DESTINATION\r");
     else printf("\rDefault mode: CONTINUOUS\r");
@@ -427,6 +432,7 @@ int main(void)
         }        
         */        
         
+        /*
         if (flagRemoteTimeout)
         {
             PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
@@ -435,7 +441,7 @@ int main(void)
             ResetPID();
             runState = HALTED;
         }
-        
+        */
         
         if (XBEEPacketLength)   // $$$$
         {            
@@ -444,8 +450,10 @@ int main(void)
                 timeout = 5000;
                 if (!runState) printf("\rState = REMOTE RUN");
                 runState = runMode = REMOTE;
-                printf("\r#%d: Packet length %d: %d, %d, %d, %d", packetCounter++, XBEEPacketLength, XBEEData[0], XBEEData[1], XBEEData[2], XBEEData[3]);
-                
+                printf("\r#%d %02X: Servo #%d: %d", packetCounter++, command, subCommand, XBEEData[0]);
+                if (command == 0xB1 && subCommand >= 0 && subCommand < NUMMOTORS)
+                    PID[subCommand].ADCommand = XBEEData[0];
+
                 /*
                 ForwardReverse = (float) XBEEData[1];                    
                 if (ForwardReverse > 0)
@@ -485,19 +493,12 @@ int main(void)
             if (TEST_OUT) TEST_OUT = 0;
             else TEST_OUT = 1;                    
             
-            // if (DEFAULT_MODE == POT_MODE)
-            {
-                IFS1bits.AD1IF = 0;
-                while(!IFS1bits.AD1IF);        
-                AD1CON1bits.ASAM = 0;        // Pause sampling. 
-                for (i = 0; i < MAXPOTS; i++)
-                    ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
-                AD1CON1bits.ASAM = 1;        // Restart sampling.
-                //ADcounts = ADresult[2];
-                //if (ADcounts < minCounts) minCounts = ADcounts;
-                //if (ADcounts > peakCounts) peakCounts = ADcounts;
-                //printf("\r%d, min: %d, max: %d", ADresult[2], minCounts, peakCounts);
-            }
+            IFS1bits.AD1IF = 0;
+            while(!IFS1bits.AD1IF);        
+            AD1CON1bits.ASAM = 0;        // Pause sampling. 
+            for (i = 0; i < MAXPOTS; i++)
+                ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
+            AD1CON1bits.ASAM = 1;        // Restart sampling.
             
             if (runState)
             {        
@@ -537,13 +538,14 @@ int main(void)
                         {
                             if (PID[i].Mode == POT_MODE) 
                             {
-                                if (runState == LOCAL) POTcontrol(i, PID, ADresult[i+6]);
-                                else POTcontrol(i, PID, XBEEData[i+1]);
+                                if (runState == LOCAL) PID[i].ADCommand = ADresult[i+6];
+                                POTcontrol(i, PID);                                     
                             }
                             else ENCODERcontrol(i, PID);                        
                             PWMvalue = PID[i].PWMvalue;
                         }
                         else PWMvalue = 0;
+                        command = 0;
                     }
                     if (i == 0) 
                     {
@@ -757,17 +759,6 @@ int main(void)
 
 
 
-/*
-void ClearCopyBuffer()
-{
-    int i;
-    for (i = 0; i < MAXBUFFER; i++)
-    {
-        RS485RxBuffer[i] = '\0';
-        // RS485_DMA_RxBuffer[i] = '\0';
-    }
-}
-*/
 
 
 void PrintServoData(short numServos, short *ptrServoPositions, unsigned char command, unsigned char subCommand)
@@ -776,114 +767,6 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
     printf("\rOK! Com: %d, Sub: %d, servos %d: ", command, subCommand, numServos);
     for (i = 0; i < 10; i++) printf("%d, ", ptrServoPositions[i]);
 }
-
-
-
-
-
-/* 10-18-20
-int ADC10_ManualInit(void)
-{
-    int i, dummy;
-    
-    AD1CON1bits.ON = 0;
-    mAD1IntEnable(INT_DISABLED);   
-    mAD1ClearIntFlag();
-    
-    AD1CON1 = 0;
-    AD1CON2 = 0;
-    AD1CON3 = 0;
-    AD1CHS  = 0;
-    AD1CSSL = 0;
-    
-    // Set each Port B pin for digital or analog
-    // Analog = 0, digital = 1
-    AD1PCFGbits.PCFG0 = 1; 
-    AD1PCFGbits.PCFG1 = 1; 
-    AD1PCFGbits.PCFG2 = 1; 
-    AD1PCFGbits.PCFG3 = 0; 
-    AD1PCFGbits.PCFG4 = 0; 
-    AD1PCFGbits.PCFG5 = 1; 
-    AD1PCFGbits.PCFG6 = 1; 
-    AD1PCFGbits.PCFG7 = 1; 
-    AD1PCFGbits.PCFG8 = 0; 
-    AD1PCFGbits.PCFG9 = 0; 
-    AD1PCFGbits.PCFG10 = 0; 
-    AD1PCFGbits.PCFG11 = 0; 
-    AD1PCFGbits.PCFG12 = 0; 
-    AD1PCFGbits.PCFG13 = 0; 
-    AD1PCFGbits.PCFG14 = 0; 
-    AD1PCFGbits.PCFG15 = 0;     
-    
-    AD1CON1bits.FORM = 000;        // 16 bit integer format.
-    AD1CON1bits.SSRC = 7;        // Auto Convert
-    AD1CON1bits.CLRASAM = 0;    // Normal operation - buffer overwritten by next conversion sequence
-    AD1CON1bits.ASAM = 0;        // Not enable Automatic sampling yet.
-    
-    AD1CON2bits.VCFG = 0;        // Reference AVdd, AVss
-    AD1CON2bits.OFFCAL = 0;        // Offset calibration disable.
-    AD1CON2bits.CSCNA = 1;        // Scan inputs for CH0+ SHA Input for Mux A input 
-    AD1CON2bits.SMPI = 0b1000;        // Interrupt after 9+1 conversion
-    AD1CON2bits.BUFM = 0;        // One 16 word buffer
-    AD1CON2bits.ALTS = 0;        // Use only Mux A
-    AD1CON2bits.SMPI =  MAXPOTS-1;    // Number of channels to sample
-    AD1CON2bits.BUFM = 0;                // Single 16-word buffer with CLRASAM.    
-    AD1CHSbits.CH0NA = 0; // Mux A Negative input from VR-
-    AD1CHSbits.CH0SA = 3; // Mux A Positive input from pin AN3
-
-    // Set conversion clock and set sampling time.
-    AD1CON3bits.ADRC = 0;        // Clock derived from peripheral bus clock
-    AD1CON3bits.SAMC = 0b11111;        // Sample time max
-    AD1CON3bits.ADCS = 0b11111111;   // Conversion time max
-
-    // Select channels to scan. Scan channels = 1, Skip channels = 0
-    AD1CSSLbits.CSSL0 = 0;
-    AD1CSSLbits.CSSL1 = 0;
-    AD1CSSLbits.CSSL2 = 0;
-    AD1CSSLbits.CSSL3 = 1;
-    AD1CSSLbits.CSSL4 = 1;
-    AD1CSSLbits.CSSL5 = 0;
-    AD1CSSLbits.CSSL6 = 0;
-    AD1CSSLbits.CSSL7 = 0;
-    AD1CSSLbits.CSSL8 = 1;
-    AD1CSSLbits.CSSL9 = 1;
-    AD1CSSLbits.CSSL10 = 1;
-    AD1CSSLbits.CSSL11 = 1;
-    AD1CSSLbits.CSSL12 = 1;
-    AD1CSSLbits.CSSL13 = 1;
-    AD1CSSLbits.CSSL14 = 1;
-    AD1CSSLbits.CSSL15 = 1;
-    
-    // Make sure all buffers have been Emptied. 
-    for (i = 0; i < 16; i++) dummy = (ADC1BUF0+i*4);    
-    
-    AD1CON1bits.ASAM = 1;        // Start Automatic Sampling. 
-    AD1CON1bits.ON = 1;            // Turn on ADC.
-    return (1);
-}
-*/
-
-/*
-void __ISR(_ADC_VECTOR, ipl2) ADInterrupt(void) 
-{
-    unsigned char i;
-    static int counter = 100;
-
-    mAD1ClearIntFlag();
-
-    // Determine which buffer is idle and create an offset
-    // offSet = 8 * ((~ReadActiveBufferADC10() & 0x01));
-
-    for (i = 0; i < MAXPOTS; i++)
-        ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
-    counter++;
-    if (counter > 100)
-    {
-        counter = 0;
-        ADready = true;    
-    }
-}
-*/
 
 
 #define ESC 27
@@ -1876,7 +1759,7 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
     return 1;
 }
 
-long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos)
+long POTcontrol(long servoID, struct PIDtype *PID)
 {
     short Error;     
     short actualPosition;
@@ -1887,7 +1770,7 @@ long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos)
     short i;
     static short displayCounter = 0;       
     
-    PID[servoID].ADCommand = CommandPos; // (short)(ADresult[servoID+6]);
+    //PID[servoID].ADCommand = CommandPos;
     PID[servoID].ADActual = (short)(ADresult[servoID+1]);
     
     /*
@@ -1941,7 +1824,7 @@ long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos)
     else PID[servoID].saturation = false;    
     
         displayCounter++;
-        if (servoID == 0)
+        if (servoID == 1)
         {
             if (displayCounter >= 20 && displayFlag)
             {            
@@ -1952,6 +1835,7 @@ long POTcontrol(long servoID, struct PIDtype *PID, short CommandPos)
     return 1;
 }
 
+/*
 short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength)
 {
 	int i, j;
@@ -2004,3 +1888,4 @@ short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char
 	}
 	else return 0;
 }
+*/
