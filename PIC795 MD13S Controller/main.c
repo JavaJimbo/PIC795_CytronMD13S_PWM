@@ -33,21 +33,37 @@
  * 11-14-20: 
  * 12-6-20:     Modified to receive MIDI device data on XBEE at 57600 baud and control first servo with it.
  *              So now it works with MIDI_Device recording and playing back one servo motor.
- * 12-16-20:    Works now with multiple sevos recording and playing back on ProTools.
+ * 12-16-20:    Works now with multiple servos recording and playing back on ProTools.
+ * 12-17-20:    Cleaned up PID for POT mode. Was very glitchy for AM 218 motors.
+ * 12-18-20:    Both RC and PID servos work great.
+ *              Use REMOTE at startup. Enabled Feather board RC servo control.
+ *              RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
+ * 12-20-20:    XBEE baud rate didn't work well at 115200. Set back to 57600.
  ***********************************************************************************/
 
 enum {
     POT_MODE = 0,
     DESTINATION_MODE,
-    CONTINUOUS_MODE
+    CONTINUOUS_MODE    
 };
 
-// #define USE_FEATHER_BOARD
+#define NO_QUAD 0
+#define QUAD_ONE 255
+#define QUAD_TWO 510
+#define QUAD_THREE 1023
+
+#define MAX_COMMAND_COUNTS 856 // 869
+#define MIN_COMMAND_COUNTS 91  // 86
+
+
+#define USE_FEATHER_BOARD
+#define USE_PID
+
 #define DEADZONE 64 
 #define PWM_MAX 4000
 #define ACCELERATION 0.1
 #define DEFAULT_MODE CONTINUOUS_MODE
-#define USE_PID
+
 #define SUCCESS 0
 #define PCA9685_ADDRESS 0x80 // Basic default address for Adafruit Feather Servo Board 
 #define FILTERSIZE 16
@@ -68,8 +84,6 @@ enum {
 #define KKI 0.04
 #define KKD 1000.0 // 30
 
-#define MAX_COMMAND_COUNTS 856 // 869
-#define MIN_COMMAND_COUNTS 91  // 86
 
 #define	STX '>'
 #define	DLE '/'
@@ -77,6 +91,7 @@ enum {
 
 #define MAXSERVOS 64  // Was 256
 #define NUMMOTORS 5
+#define NUM_RC_SERVOS 5
 
 #define FORWARD 0
 #define REVERSE 1
@@ -106,7 +121,7 @@ enum {
 #pragma config FPLLIDIV = DIV_2         // PLL Input Divider
 #pragma config FPLLODIV = DIV_1         // PLL Output Divider
 #pragma config FPBDIV   = DIV_1         // Peripheral Clock divisor
-#pragma config FWDTEN   = ON            // Watchdog Timer enabled
+#pragma config FWDTEN   = OFF            // Watchdog Timer enabled
 #pragma config WDTPS = PS8192           // Watchdog Timer Postscaler (1:8192) For 31,250 clock divided by 8192 = 262 mS timeout
 #pragma config FCKSM    = CSDCMD        // Clock Switching & Fail Safe Clock Monitor
 #pragma config OSCIOFNC = OFF           // CLKO Enable
@@ -132,7 +147,7 @@ enum
     REMOTE    
 };
 
-#define TEST_OUT LATCbits.LATC1
+ #define TEST_OUT LATCbits.LATC1
 
 #define PWM1 OC1RS
 #define PWM2 OC2RS
@@ -209,15 +224,16 @@ struct PIDtype
     long  Destination;
     float  CommandPos;    
     long ActualPos;
+    unsigned short PreviousQuad;
     float Velocity;
     float TargetVelocity;
     float ActualVelocity[FILTERSIZE];
     short ADCommand;
     unsigned char saturation;
-    unsigned char reset;
-    short previousPosition;
-    unsigned Mode;    
+    unsigned char reset;    
+    unsigned char Mode;    
     unsigned char Halted;
+    unsigned char RemoteDataValid;
 } PID[NUMMOTORS];
 
 
@@ -240,9 +256,8 @@ short XBEEPacketLength;
 unsigned char RS485RxBufferFull = false;
 unsigned char RS485TxBufferFull = false;
 unsigned char RS485_DMA_RxBuffer[MAXBUFFER+1];
-// unsigned char RS485_DMA_TxBuffer[MAXBUFFER+1] = "This is not a test.\r";
 unsigned char RS485RxBuffer[MAXBUFFER+1];
-unsigned char RS485TxBuffer[MAXBUFFER+1] = "\rThis has got to be the one";
+unsigned char RS485TxBuffer[MAXBUFFER+1];
 int RS485TxIndex = 0;
 int RS485TxLength = 0;
 unsigned char ServoData[MAXBUFFER+1];
@@ -278,13 +293,6 @@ unsigned char DATABufferFull = false;
 // void ClearCopyBuffer();
 void makeFloatString(float InValue, int numDecimalPlaces, unsigned char *arrAscii);
 
-enum
-{
-    QUAD_NONE = 0,
-    QUAD_ONE,
-    QUAD_TWO,
-    QUAD_THREE
-};
 
 enum
 {
@@ -303,12 +311,14 @@ unsigned short SWRead = 0;
 unsigned char SWChangeFlag = false;
 unsigned char intFlag = false;
 unsigned char memoryFlag = false;
-unsigned char runState = HALTED;
+
 short errIndex = 0;
 unsigned char startPacket = false;
 short XBEEtimeout = 0;
 
 #define PCA9685_ADDRESS 0x80 // Basic default address for Adafruit Feather Servo Board
+
+long ActualXBEEBaudRate, ActualHOSTBaudRate;
 
 int main(void) 
 {
@@ -316,82 +326,74 @@ int main(void)
     long PWMvalue = 0;        
     int JogPWM = 0;
     float floValue;            
-    short length = 0;
-    unsigned short numBytes;
-    unsigned char MessageOut[] = "You can eat the driver and his gloves\r\n ";
-    unsigned char MessageIn[64] = "";
     unsigned ADdisplay = true;    
     short SWcounter = 0;    
-    unsigned char runMode = LOCAL;
-    short startAddress = 0x0000;
-    #define NUM_RC_SERVOS 4
-    short RCservoPos[NUM_RC_SERVOS] = {0,0,0,0};
-    short PreviousRCservoPos[NUM_RC_SERVOS] = {0,0,0,0};
-    short DisplayCounter = 0;
-    short testCounter = 0;
-    short MotorFour;
-    short ENCdisplayCounter = 0;           
-    short dataLength = 0;    
-    short numServos;
-    short ServoPositions[MAXSERVOS] = {512,512,512,512};    
+    #define NUM_RC_SERVOS 5
+    short RCservoPos[NUM_RC_SERVOS] = {0,0,0,0,0};
+    short PreviousRCservoPos[NUM_RC_SERVOS] = {0,0,0,0,0};
     unsigned char ch, command, subCommand, outPacket[MAXBUFFER];
     short numDataIntegers, outData[MAXBUFFER], packetLength;          
-    short peakCounts = 0, minCounts = 1023, ADcounts = 0;    
-    unsigned char CRCerror = false;    
     short packetCounter = 0;
+    float tempCommand;
+    short ServoCommandPosition;
+    unsigned char runMode = REMOTE;
+    unsigned char runState = HALTED;    
+    short RCServoID = 0;
+    short testCounter = 0;
+    short displayCounter = 0;
     
     InitPID();     
-    DelayMs(10);
+    DelayMs(10);       
     
-    InitializeSystem();          
+    InitializeSystem();                 
     
-    DelayMs(100);
+    runState = runMode = REMOTE;
+
+    //DelayMs(10);
+    //printf("\rInitializing I2C #1");
+    //initI2C(I2C1);
+    //numBytes = strlen(MessageOut);
+    //printf("\rWriting %d bytes to EEprom", numBytes);
+    //EepromWriteBlock (I2C1, EEPROM_ID, startAddress, MessageOut, numBytes);
+    //printf("\rReading %d bytes from EEprom", numBytes);
+    //EepromReadBlock (I2C1, EEPROM_ID, startAddress, MessageIn, numBytes);
+    //MessageIn[numBytes] = '0';
+    //printf("\rMessage: %s", MessageIn);
     
-    printf("\r\rTESTING MD13S SERVO CONTROLLER with XBEE MIDI IN #1");
-    printf("\rRemote timeouts disabled");
+    printf("\r\rSTART TEST #1");
+    printf("\rHOST Baudrate: %ld", ActualHOSTBaudRate);        
+    printf("\rXBEE Baudrate: %ld", ActualXBEEBaudRate);
+
+    /*
+    ch = 'A';
+    while(1)
+    {
+        DelayMs(200);        
+        if (UARTReceivedDataIsAvailable(XBEEuart)) 
+        {
+            ch = UARTGetDataByte(XBEEuart);   
+            printf("\rCH = %c", ch);
+            DelayMs(20);        
+            
+            while(!UARTTransmitterIsReady(XBEEuart));
+            UARTSendDataByte(XBEEuart, ch);    
+        }
+    }
+    */
+    
+    if (runState==LOCAL) printf("\rRunMode = LOCAL");
+    else if (runState==REMOTE) printf("\rRunMode = REMOTE");
+    else if (runState==JOG) printf("\rRunMode = JOG");
+    else printf("\rRunMode = STANDBY");    
+    
+    if (runState == HALTED) printf("\rRUN STATE: HALTED");
+    else printf("\rRUN STATE: ON");
     
 #ifdef USE_FEATHER_BOARD
     printf("\rInitializing Feather Servo Board at address 0x80: ");
     if (initializePCA9685(PCA9685_ADDRESS)) printf(" SUCCESS");
     else printf(" ERROR");    
-}
 #endif
-
-#ifdef USE_PID    
-
-    runState = runMode;
-
-    if (DEFAULT_MODE == POT_MODE) printf("\rDefault mode: POT MODE\r");    
-    else if (DEFAULT_MODE == DESTINATION_MODE) printf("\rDefault mode: DESTINATION\r");
-    else printf("\rDefault mode: CONTINUOUS\r");
-        
-    if (runState==LOCAL) printf("RunMode = LOCAL");
-    else if (runState==REMOTE) printf("RunMode = REMOTE");
-    else if (runState==JOG) printf("RunMode = JOG");
-    else printf("RunMode = STANDBY");    
-    
-    printf("\rComplementary wheelchair motors on Servos #2 and #3");
-#else
-    printf("\r\rSERVOS Disabled\r");    
-    if (runState==LOCAL) printf("RunMode = LOCAL");
-    else if (runState==REMOTE) printf("RunMode = REMOTE");
-    else if (runState==JOG) printf("RunMode = JOG");
-    else printf("RunMode = STANDBY");    
-    
-    DelayMs(10);
-    printf("\rInitializing I2C #1");
-    initI2C(I2C1);
-    numBytes = strlen(MessageOut);
-    printf("\rWriting %d bytes to EEprom", numBytes);
-    EepromWriteBlock (I2C1, EEPROM_ID, startAddress, MessageOut, numBytes);
-    printf("\rReading %d bytes from EEprom", numBytes);
-    EepromReadBlock (I2C1, EEPROM_ID, startAddress, MessageIn, numBytes);
-    MessageIn[numBytes] = '0';
-    printf("\rMessage: %s", MessageIn);
-#endif
-    
-    //printf("\rTesting DMA Rx and Tx on RS485");
-    
     while(1) 
     {   
         ClrWdt(); // CLEAR_WATCHDOG
@@ -409,125 +411,91 @@ int main(void)
             else printf("SW4 LOW");                 
         }        
         
-        /*
-        if (RS485RxBufferFull)
-        {
-            RS485RxBufferFull = false;
-            printf("\rReceived RS485: %s", RS485RxBuffer);
-            strcpy(RS485TxBuffer, "\rReceived: ");
-            strcat(RS485TxBuffer, RS485RxBuffer);
-            StartRS485Tx();
-        }
-        */
-        
-        /*
-        if (RS485RxBufferFull)
-        {            
-            RS485RxBufferFull = false;
-            dataLength =  decodePacket(RS485RxBuffer, PacketData);            
-            if (!processPacketData(dataLength, PacketData, &numData, , &command, &subCommand)) 
-                printf("\rCRC ERROR");
-            else PrintServoData(numServos, ServoPositions, command, subCommand);                                    
-            ClearCopyBuffer();
-        }        
-        */        
-        
-        /*
-        if (flagRemoteTimeout)
-        {
-            PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
-            flagRemoteTimeout = false;            
-            printf("\r\rSystem HALTED.");
-            ResetPID();
-            runState = HALTED;
-        }
-        */
-        
         if (XBEEPacketLength)   // $$$$
-        {            
+        {         
             if ( processPacketData(XBEEPacketLength, XBEEPacket, &numDataIntegers, XBEEData, &command, &subCommand))
             {
-                timeout = 5000;
-                if (!runState) printf("\rState = REMOTE RUN");
-                runState = runMode = REMOTE;
-                printf("\r#%d %02X: Servo #%d: %d", packetCounter++, command, subCommand, XBEEData[0]);
-                if (command == 0xB1 && subCommand >= 0 && subCommand < NUMMOTORS)
-                    PID[subCommand].ADCommand = XBEEData[0];
-
-                /*
-                ForwardReverse = (float) XBEEData[1];                    
-                if (ForwardReverse > 0)
-                {
-                    ForwardReverse = ForwardReverse - DEADZONE;
-                    if (ForwardReverse < 0) ForwardReverse = 0;
+                timeout = 5000;                                                
+                if (command == 0xB1 && subCommand >= 0)
+                {                    
+                    if (subCommand < NUMMOTORS)
+                    {
+                        tempCommand = ((float)XBEEData[0]) / 1023;
+                        tempCommand = (tempCommand * (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS)) + MIN_COMMAND_COUNTS;
+                        ServoCommandPosition = (short)tempCommand;                        
+                        if (ServoCommandPosition < MIN_COMMAND_COUNTS) ServoCommandPosition = MIN_COMMAND_COUNTS;
+                        if (ServoCommandPosition > MAX_COMMAND_COUNTS) ServoCommandPosition = MAX_COMMAND_COUNTS;                        
+                        PID[subCommand].ADCommand = ServoCommandPosition;
+                        PID[subCommand].RemoteDataValid = true;
+                    }
+                    else
+                    {
+                        RCServoID = subCommand - NUMMOTORS;
+                        if (RCServoID < NUM_RC_SERVOS)
+                        {
+                            ServoCommandPosition = (XBEEData[0] / 4) + 22;
+                            if (ServoCommandPosition < 0) ServoCommandPosition = 0;
+                            else if (ServoCommandPosition > 277) ServoCommandPosition = 277;
+                            RCservoPos[RCServoID] = ServoCommandPosition;
+                        }                        
+                    }
+                    printf("\rREMOTE #%d %02X: Servo #%d: XBEE: %d, COM: %d", packetCounter++, command, subCommand, XBEEData[0], ServoCommandPosition);
                 }
-                else if (ForwardReverse < 0)
-                {
-                    ForwardReverse = ForwardReverse + DEADZONE;
-                    if (ForwardReverse > 0) ForwardReverse = 0;
-                }
-                    
-                RightLeft = (float) XBEEData[0];
-                if (RightLeft > 0)
-                {
-                    RightLeft = RightLeft - DEADZONE;
-                    if (RightLeft < 0) RightLeft = 0;
-                }
-                else if (RightLeft < 0)
-                {
-                    RightLeft = RightLeft + DEADZONE;
-                    if (RightLeft > 0) RightLeft = 0;
-                }                    
-                PID[2].TargetVelocity = (RightLeft + ForwardReverse) / 10;
-                PID[3].TargetVelocity = (RightLeft - ForwardReverse) / 10;
-                */
             }
             XBEEPacketLength = 0;
         }        
-
-#ifdef USE_PID                    
+                    
         if (intFlag)
         {
-            intFlag = false;
-            
-            if (TEST_OUT) TEST_OUT = 0;
-            else TEST_OUT = 1;                    
+            intFlag = false;            
             
             IFS1bits.AD1IF = 0;
             while(!IFS1bits.AD1IF);        
             AD1CON1bits.ASAM = 0;        // Pause sampling. 
-            for (i = 0; i < MAXPOTS; i++)
-                ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
+            for (i = 0; i < MAXPOTS; i++)            
+                ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer            
             AD1CON1bits.ASAM = 1;        // Restart sampling.
             
             if (runState)
             {        
 #ifdef USE_FEATHER_BOARD
-                for (i = 0; i < NUM_RC_SERVOS; i++) RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
-                // printf("\r#%d: 1 = %d, 2 = %d, 3 = %d, 4 = %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3]);                
+                if (runMode == LOCAL)
+                {
+                    for (i = 0; i < NUM_RC_SERVOS; i++) RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
+                }
                 
                 if (PreviousRCservoPos[0]!=RCservoPos[0])
                 {
                     PreviousRCservoPos[0]=RCservoPos[0];
                     if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf("\r#0 ERROR");
+                    //else printf("\rRC Servo #0: %d", RCservoPos[0]);
                 }
                 if (PreviousRCservoPos[1]!=RCservoPos[1])
                 {
-                    PreviousRCservoPos[1]=RCservoPos[1];
+                    PreviousRCservoPos[1]=RCservoPos[1];                    
                     if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf("\r#1 ERROR");
+                    //else printf("\rRC Servo #1: %d", RCservoPos[1]);
                 }
                 if (PreviousRCservoPos[2]!=RCservoPos[2])
                 {
                     PreviousRCservoPos[2]=RCservoPos[2];
                     if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf("\r#2 ERROR");
+                    //else printf("\rRC Servo #2: %d", RCservoPos[2]);
                 }
                 if (PreviousRCservoPos[3]!=RCservoPos[3])
                 {
                     PreviousRCservoPos[3]=RCservoPos[3];
                     if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf("\r#3 ERROR");
-                }                
-#endif                
-                
+                    //else printf("\rRC Servo #3: %d", RCservoPos[3]);
+                }     
+                if (PreviousRCservoPos[4]!=RCservoPos[4])
+                {
+                    PreviousRCservoPos[4]=RCservoPos[4];
+                    if (!setPCA9685outputs (PCA9685_ADDRESS, 4, 0, RCservoPos[4])) printf("\r#4 ERROR");
+                    //else printf("\rRC Servo #4: %d", RCservoPos[4]);
+                }                     
+#endif
+#ifdef USE_PID              
                 for (i = 0; i < NUMMOTORS; i++)
                 {                             
                     if (runState == JOG) 
@@ -538,8 +506,20 @@ int main(void)
                         {
                             if (PID[i].Mode == POT_MODE) 
                             {
-                                if (runState == LOCAL) PID[i].ADCommand = ADresult[i+6];
-                                POTcontrol(i, PID);                                     
+                                if (runState == LOCAL) 
+                                {
+                                    tempCommand = ((float)ADresult[i+6]) / 1023;
+                                    tempCommand = (tempCommand * (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS)) + MIN_COMMAND_COUNTS;
+                                    if (tempCommand < MIN_COMMAND_COUNTS) tempCommand = MIN_COMMAND_COUNTS;
+                                    if (tempCommand > MAX_COMMAND_COUNTS) tempCommand = MAX_COMMAND_COUNTS;
+                                    PID[i].ADCommand = (short)tempCommand;                                    
+                                    POTcontrol(i, PID);
+                                }
+                                else
+                                {
+                                    if (PID[i].RemoteDataValid) POTcontrol(i, PID);
+                                    else PID[i].PWMvalue = 0;
+                                }
                             }
                             else ENCODERcontrol(i, PID);                        
                             PWMvalue = PID[i].PWMvalue;
@@ -598,20 +578,19 @@ int main(void)
                         else MOTOR_DIR5 = FORWARD;                            
                         PWM5 = (unsigned short)PWMvalue;
                     }                    
-                }                                                
+                }
                 errIndex++; 
-                if (errIndex >= FILTERSIZE) errIndex = 0;
-                
+                if (errIndex >= FILTERSIZE) errIndex = 0;                
             }
             else            
             {
                 for (i = 0; i < NUMMOTORS; i++) PID[i].sumError = 0;
                 PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
                 LED = 0;
-            }               
-        }    
-#endif        
-        
+            }                           
+#endif          
+        } // End if intFlag
+    
         if (HOSTRxBufferFull)
         {
             HOSTRxBufferFull = false; 
@@ -672,11 +651,13 @@ int main(void)
                         break;
                     case 'X':
                         runMode = REMOTE;
-                        printf("REMOTE MODE ON");
+                        runState = STANDBY;
+                        printf("REMOTE MODE");
                         break;
                     case 'L':
                         runMode = LOCAL;
-                        printf("LOCAL ON");
+                        runState = STANDBY;
+                        printf("LOCAL MODE");
                         break;       
                     case 'J':
                         JogPWM = (long) floValue;
@@ -697,7 +678,6 @@ int main(void)
                             else if (runState==REMOTE) printf("\rRun State = REMOTE");
                             else if (runState==JOG) printf("\rRun State = JOG");
                             else printf("\rERROR RunMode = %d", runMode);
-                            ENCdisplayCounter = 0;
                             if (PID[3].Velocity > 0) PID[3].Destination = PID[3].Destination + (abs(PID[3].Destination - PID[3].ActualPos));
                             else PID[3].Destination = PID[3].Destination - (abs(PID[3].Destination - PID[3].ActualPos));
                             printf(", Destination: %ld, Velocity: %0.3f", PID[3].Destination, PID[3].Velocity);
@@ -735,13 +715,7 @@ int main(void)
                         PID[2].Velocity = PID[3].Velocity;
                         break;                        
                     case 'Z':
-                        if (q) PID[3].Destination = (long)floValue;
-                        
-                        //if (PID[3].Destination > PID[3].previousPosition && PID[3].Velocity < 0)
-                        //    PID[3].Velocity = 0 - PID[3].Velocity;                        
-                        //else if (PID[3].Destination < PID[3].previousPosition && PID[3].Velocity > 0) 
-                        //    PID[3].Velocity = 0 - PID[3].Velocity;                        
-                        // PID[2].Velocity = PID[3].Velocity;
+                        if (q) PID[3].Destination = (long)floValue;                        
                         printf("Destination: %ld, Velocity: %0.3f", PID[3].Destination, PID[3].Velocity);
                         break;                        
                     default:                        
@@ -752,7 +726,7 @@ int main(void)
                 
                 CONTINUE1: continue;
                 command = 0;
-            } // End if command             
+            } // End if (command)
         } // End if HOSTRxBufferFull        
     } // End while(1))
 } // End main())
@@ -900,7 +874,7 @@ void __ISR(_DMA1_VECTOR, IPL5SOFT) DmaTxHandler(void)
 }
 */
     
-
+/*
 void SetupDMA_Rx(void)
 {
     int i;
@@ -925,6 +899,7 @@ void SetupDMA_Rx(void)
     DmaChnEnable(DMA_CHANNEL0);
     
 }
+*/
 
 /*
 void SetupDMA_Tx(void)
@@ -962,7 +937,7 @@ void InitializeSystem(void)
     ADC10_ManualInit();    
     
     // Set up UART Rx DMA interrupts
-    SetupDMA_Rx();
+    // SetupDMA_Rx();
     
     // I/O Ports:
     PORTSetPinsDigitalOut(IOPORT_A, BIT_5);  // MOTOR_DIR4 
@@ -1074,9 +1049,10 @@ void InitializeSystem(void)
     
     // Set up HOST UART    
     UARTConfigure(HOSTuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
+    // UARTConfigure(HOSTuart, UART_ENABLE_PINS_TX_RX_ONLY);
     UARTSetFifoMode(HOSTuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
     UARTSetLineControl(HOSTuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    UARTSetDataRate(HOSTuart, SYS_FREQ, 921600);
+    ActualHOSTBaudRate = UARTSetDataRate(HOSTuart, SYS_FREQ, 921600);
     UARTEnable(HOSTuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
 
     // Configure HOST UART Interrupts
@@ -1085,7 +1061,8 @@ void InitializeSystem(void)
     INTSetVectorPriority(INT_VECTOR_UART(HOSTuart), INT_PRIORITY_LEVEL_2);
     INTSetVectorSubPriority(INT_VECTOR_UART(HOSTuart), INT_SUB_PRIORITY_LEVEL_0);    
     
-    // Set up RS485 UART    
+    // Set up RS485 UART   
+    /*
     UARTConfigure(RS485uart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
     UARTSetFifoMode(RS485uart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
     UARTSetLineControl(RS485uart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
@@ -1098,14 +1075,14 @@ void InitializeSystem(void)
     INTEnable(INT_SOURCE_UART_RX(RS485uart), INT_DISABLED); 
     INTSetVectorPriority(INT_VECTOR_UART(RS485uart), INT_PRIORITY_LEVEL_2);
     INTSetVectorSubPriority(INT_VECTOR_UART(RS485uart), INT_SUB_PRIORITY_LEVEL_0);  
-    
+    */
  
-    // Set up XBEE UART    
-    UARTConfigure(XBEEuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);
+    // Set up XBEE UART at 57600 baud
+    UARTConfigure(XBEEuart, UART_ENABLE_HIGH_SPEED | UART_ENABLE_PINS_TX_RX_ONLY);    
+    // UARTConfigure(XBEEuart, UART_ENABLE_PINS_TX_RX_ONLY);    
     UARTSetFifoMode(XBEEuart, UART_INTERRUPT_ON_TX_DONE | UART_INTERRUPT_ON_RX_NOT_EMPTY);
     UARTSetLineControl(XBEEuart, UART_DATA_SIZE_8_BITS | UART_PARITY_NONE | UART_STOP_BITS_1);
-    UARTSetDataRate(XBEEuart, SYS_FREQ, 57600);
-    // ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 2000000);
+    ActualXBEEBaudRate = UARTSetDataRate(XBEEuart, SYS_FREQ, 57600);
     UARTEnable(XBEEuart, UART_ENABLE_FLAGS(UART_PERIPHERAL | UART_RX | UART_TX));
 
     // Configure XBEE UART Interrupts
@@ -1198,70 +1175,6 @@ int StartRS485Tx()
     return RS485TxLength;
 }
 
-/*
-    printf("\r#1: Testing Feather Servos & PID");
-    MOTOR_DIR1 = MOTOR_DIR2 = MOTOR_DIR3 = MOTOR_DIR4 = MOTOR_DIR5 = 1;
-    PWM1 = PWM2 = PWM3 = PWM4 = PWM5 = 0;
-    RS485_ENABLE = 0;    
-        
-    DelayMs(100);
-    printf("\r\rFeather Servo NO USB version");
-    printf("\rInitializing Feather Servo Board at address 0x80: ");
-    if (initializePCA9685(PCA9685_ADDRESS)) printf(" SUCCESS");
-    else printf(" ERROR");        
-        
-    printf("\rSetting servo pulse: ");
-        
-    while(1)
-    {        
-        if (intFlag)
-        {
-            intFlag = false;
-            TEST_OUT = 1;
-            IFS1bits.AD1IF = 0;
-            while(!IFS1bits.AD1IF);        
-            AD1CON1bits.ASAM = 0;        // Pause sampling. 
-            for (i = 0; i < MAXPOTS; i++)
-                ADresult[i] = (unsigned short) ReadADC10(i); // read the result of channel 0 conversion from the idle buffer
-            AD1CON1bits.ASAM = 1;        // Restart sampling.    
-            for (i = 0; i < 4; i++)
-            {
-                RCservoPos[i] = (short)(ADresult[i+6]/4) + 22; 
-            }
-            DisplayCounter++;
-            if (DisplayCounter > 10) 
-            {
-                DisplayCounter = 0;
-                printf("\r#%d: RC Servos: %d, %d, %d, %d, %d, %d, %d, %d", testCounter++, RCservoPos[0], RCservoPos[1], RCservoPos[2], RCservoPos[3], RCservoPos[4], RCservoPos[5], RCservoPos[6], RCservoPos[7]);
-            }            
-             
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 0, 0, RCservoPos[0])) printf(" Servo 0 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 1, 0, RCservoPos[1])) printf("  Servo 1 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 2, 0, RCservoPos[2])) printf("  Servo 2 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 3, 0, RCservoPos[3])) printf("  Servo 3 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 4, 0, RCservoPos[0])) printf(" Servo 4 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 5, 0, RCservoPos[1])) printf("  Servo 5 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 6, 0, RCservoPos[2])) printf("  Servo 6 ERROR");
-            if (!setPCA9685outputs (PCA9685_ADDRESS, 7, 0, RCservoPos[3])) printf("  Servo 7 ERROR");
-            
-            
-            mAD1IntEnable(INT_ENABLED);
-        }        
-        // printf("\r#%d Servo position: %d", counter++, servoPos);           
-        
-        if (HOSTRxBufferFull)
-        {
-            HOSTRxBufferFull = false;
-            printf("\rReceived: %s", HOSTRxBuffer);
-        }
-        // 
-    } // end while(1)    
-*/ 
-
-
-
-
-
 void ClearCopyBuffer()
 {
     int i;
@@ -1271,52 +1184,6 @@ void ClearCopyBuffer()
     }
 }
 
-// XBEE UART interrupt handler it is set at priority level 2
-void __ISR(XBEE_VECTOR, ipl2) IntXBEEUartHandler(void) 
-{
-    unsigned char ch;
-    static short XBEERxIndex = 0;    
-    short i;
-
-    if (XBEEbits.OERR || XBEEbits.FERR) 
-    {
-        if (UARTReceivedDataIsAvailable(XBEEuart))
-            ch = UARTGetDataByte(XBEEuart);
-        XBEEbits.OERR = 0;
-        XBEERxIndex = 0;
-    } 
-    else if (INTGetFlag(INT_SOURCE_UART_RX(XBEEuart)))
-    {
-        INTClearFlag(INT_SOURCE_UART_RX(XBEEuart));
-        if (UARTReceivedDataIsAvailable(XBEEuart)) 
-        {
-            XBEEtimeout = 10;
-            ch = UARTGetDataByte(XBEEuart);
-            if (!startPacket) 
-            {
-                if (ch == STX)
-                {
-                    startPacket = true;
-                    XBEERxIndex = 0;
-                    XBEERxBuffer[XBEERxIndex++] = STX;
-                }
-            }
-            else if (XBEERxIndex < MAXBUFFER) 
-                    XBEERxBuffer[XBEERxIndex++] = ch;
-            if (ch == ETX) 
-            {
-                XBEEPacketLength = XBEERxIndex;
-                XBEERxIndex = 0;
-                for (i = 0; i < XBEEPacketLength; i++)
-                    XBEEPacket[i] = XBEERxBuffer[i];
-                startPacket = false;
-                XBEEtimeout = 0;
-            }                
-        }
-    }
-    if (INTGetFlag(INT_SOURCE_UART_TX(XBEEuart))) 
-        INTClearFlag(INT_SOURCE_UART_TX(XBEEuart));
-}
 
 unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, short *numData, short *ptrData, unsigned char *command, unsigned char *subCommand)
 {
@@ -1448,17 +1315,15 @@ void ResetPID()
         PID[i].ActualPos = 0;
         PID[i].CommandPos = 0;
         PID[i].Halted = false;
+        PID[i].RemoteDataValid = false;
         PID[i].Mode = DEFAULT_MODE;
-        PID[i].previousPosition = PID[i].ActualPos;
+        PID[i].PreviousQuad = NO_QUAD;
         PID[i].Velocity = 0;
         for (j = 0; j < FILTERSIZE; j++) PID[i].error[j] = 0;
     }
     PID[0].Mode = POT_MODE;
     PID[1].Mode = POT_MODE;
     PID[4].Mode = POT_MODE;
-    //PID[0].Halted = true;
-    //PID[1].Halted = true;
-    //PID[4].Halted = true;
     errIndex = 0;
 }
 
@@ -1469,7 +1334,7 @@ void InitPID()
     for (i = 0; i < NUMMOTORS; i++)
     {
         PID[i].Destination = 180;
-        PID[i].previousPosition = 0;        
+        //PID[i].previousPosition = 0;        
         PID[i].Mode = 0;
         PID[i].TargetVelocity = 0;        
         
@@ -1576,6 +1441,7 @@ int ADC10_ManualInit(void)
     AD1CON1bits.ON = 1;            // Turn on ADC.
     return (1);
 }
+
 
 long ENCODERcontrol(long servoID, struct PIDtype *PID)
 {
@@ -1759,6 +1625,15 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
     return 1;
 }
 
+#define NO_QUAD 0
+#define QUAD_ONE 255
+#define QUAD_TWO 510
+#define QUAD_THREE 1023
+
+#define MAX_COMMAND_COUNTS 856 // 869
+#define MIN_COMMAND_COUNTS 91  // 86
+
+
 long POTcontrol(long servoID, struct PIDtype *PID)
 {
     short Error;     
@@ -1768,28 +1643,36 @@ long POTcontrol(long servoID, struct PIDtype *PID)
     long derError;    
     float PCorr = 0, ICorr = 0, DCorr = 0;    
     short i;
-    static short displayCounter = 0;       
-    
-    //PID[servoID].ADCommand = CommandPos;
-    PID[servoID].ADActual = (short)(ADresult[servoID+1]);
-    
-    /*
-    if (PID[servoID].ADActual < (MIN_COMMAND_COUNTS/2)) 
-    {
-        PID[servoID].PWMvalue = 0;
-        PID[servoID].sumError = 0;        
-        printf("\rSENSOR ERROR - ACTUAL: %d", PID[servoID].ADActual);
-        return (0);
-    }           
-      */
-   
-    if (PID[servoID].ADActual < 341 && PID[servoID].ADCommand > 682) actualPosition = PID[servoID].ADActual + (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS);
-    else if (PID[servoID].ADActual > 682 && PID[servoID].ADCommand < 341) actualPosition = PID[servoID].ADActual - (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS);
-    else actualPosition = PID[servoID].ADActual;
-    
-    PID[servoID].previousPosition = actualPosition;
+    static short displayCounter = 0;    
+    unsigned short QuadReading = 0;
     
     commandPosition = PID[servoID].ADCommand;
+    
+    PID[servoID].ADActual = (short)(ADresult[servoID+1]);
+    actualPosition = PID[servoID].ADActual;
+    
+    
+    if (PID[servoID].ADActual < QUAD_ONE) QuadReading = QUAD_ONE;
+    else if (PID[servoID].ADActual < QUAD_TWO) QuadReading = QUAD_TWO;
+    else QuadReading = QUAD_THREE;
+    
+    if (PID[servoID].PreviousQuad == NO_QUAD) 
+        PID[servoID].PreviousQuad = QuadReading;
+    else if (QuadReading == QUAD_TWO)
+        PID[servoID].PreviousQuad = QUAD_TWO;
+    else if (PID[servoID].PreviousQuad == QUAD_TWO)
+        PID[servoID].PreviousQuad = QuadReading;
+    else if (PID[servoID].PreviousQuad == QUAD_ONE)
+    {
+        if (QuadReading == QUAD_THREE) 
+            actualPosition = PID[servoID].ADActual - (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS);
+    }
+    else if (PID[servoID].PreviousQuad == QUAD_THREE)
+    {
+        if (QuadReading == QUAD_ONE) 
+            actualPosition = PID[servoID].ADActual + (MAX_COMMAND_COUNTS - MIN_COMMAND_COUNTS);
+    }
+    
     Error = actualPosition - commandPosition;            
     PID[servoID].error[errIndex] = Error;
     
@@ -1826,66 +1709,65 @@ long POTcontrol(long servoID, struct PIDtype *PID)
         displayCounter++;
         if (servoID == 1)
         {
-            if (displayCounter >= 20 && displayFlag)
-            {            
-                printf("\rCOM: %d, ROT: %d, ACT: %d ERR: %d P: %0.1f D: %0.1f I: %0.1f PWM: %d ", PID[servoID].ADCommand, PID[servoID].ADActual, actualPosition, Error, PCorr, DCorr, ICorr, PID[servoID].PWMvalue);
+            if (displayCounter >= 40 && displayFlag)
+            {   
+                if (PID[servoID].PreviousQuad == QUAD_ONE) printf("\rQI ");
+                else if (PID[servoID].PreviousQuad == QUAD_TWO) printf("\rQII ");
+                else printf("\rQIII ");
+                printf("COM: %d, ROT: %d, ACT: %d ERR: %d P: %0.1f I: %0.1f PWM: %d ", PID[servoID].ADCommand, PID[servoID].ADActual, actualPosition, Error, PCorr, ICorr, PID[servoID].PWMvalue);
                 displayCounter = 0;
             }
         }
     return 1;
 }
 
-/*
-short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength)
+// XBEE UART interrupt handler it is set at priority level 2
+void __ISR(XBEE_VECTOR, ipl2) IntXBEEUartHandler(void) 
 {
-	int i, j;
-    unsigned char arrOutputBytes[64];
-	short packetIndex = 0, numBytes = 0;
-    unsigned char dataByte;    
+    unsigned char ch;
+    static short XBEERxIndex = 0;    
+    short i;
     
-    union
+                if (TEST_OUT) TEST_OUT = 0;
+            else TEST_OUT = 1;                        
+
+    
+    if (XBEEbits.OERR || XBEEbits.FERR) 
     {
-        unsigned char b[2];
-        unsigned short integer;
-    } convert;	
-
-	j = 0;
-	// Header first
-	arrOutputBytes[j++] = command;
-	arrOutputBytes[j++] = subcommand;
-	arrOutputBytes[j++] = numData;
-
-	// Convert integer data to unsigned chars    
-	for (i = 0; i < numData; i++)
-	{
-		convert.integer = ptrData[i];
-		arrOutputBytes[j++] = convert.b[0];
-		arrOutputBytes[j++] = convert.b[1];
-	}
-
-	convert.integer = CalculateModbusCRC(arrOutputBytes, j);      
-    
-	arrOutputBytes[j++] = convert.b[0];
-	arrOutputBytes[j++] = convert.b[1];
-	numBytes = j;
-
-	if (numBytes <= (MAXBUFFER + 16))
-	{
-        packetIndex = 0;
-		ptrPacket[packetIndex++] = STX;
-		for (i = 0; i < numBytes; i++)
-		{
-			dataByte = arrOutputBytes[i];
-			if (dataByte == STX || dataByte == DLE || dataByte == ETX)
-				ptrPacket[packetIndex++] = DLE;
-			if (packetIndex >= MAXBUFFER) return 0;
-			if (dataByte == ETX) dataByte = ETX - 1;
-			ptrPacket[packetIndex++] = dataByte;
-		}
-		ptrPacket[packetIndex++] = ETX;
-		*packetLength = packetIndex;
-		return (packetIndex);
-	}
-	else return 0;
+        if (UARTReceivedDataIsAvailable(XBEEuart))
+            ch = UARTGetDataByte(XBEEuart);
+        XBEEbits.OERR = 0;
+        XBEERxIndex = 0;
+    } 
+    else if (INTGetFlag(INT_SOURCE_UART_RX(XBEEuart)))
+    {
+        INTClearFlag(INT_SOURCE_UART_RX(XBEEuart));
+        if (UARTReceivedDataIsAvailable(XBEEuart)) 
+        {
+            XBEEtimeout = 10;
+            ch = UARTGetDataByte(XBEEuart);
+            if (!startPacket) 
+            {
+                if (ch == STX)
+                {
+                    startPacket = true;
+                    XBEERxIndex = 0;
+                    XBEERxBuffer[XBEERxIndex++] = STX;
+                }
+            }
+            else if (XBEERxIndex < MAXBUFFER) 
+                    XBEERxBuffer[XBEERxIndex++] = ch;
+            if (ch == ETX) 
+            {
+                XBEEPacketLength = XBEERxIndex;
+                XBEERxIndex = 0;
+                for (i = 0; i < XBEEPacketLength; i++)
+                    XBEEPacket[i] = XBEERxBuffer[i];
+                startPacket = false;
+                XBEEtimeout = 0;
+            }                
+        }
+    }
+    if (INTGetFlag(INT_SOURCE_UART_TX(XBEEuart))) 
+        INTClearFlag(INT_SOURCE_UART_TX(XBEEuart));
 }
-*/
