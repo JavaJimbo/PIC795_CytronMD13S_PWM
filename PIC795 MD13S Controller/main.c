@@ -39,12 +39,21 @@
  *              Use REMOTE at startup. Enabled Feather board RC servo control.
  *              RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
  * 12-20-20:    XBEE baud rate didn't work well at 115200. Set back to 57600.
+ * 12-27-20:    Added errorCode to detect transmission errors on incoming data.
  ***********************************************************************************/
 
 enum {
     POT_MODE = 0,
     DESTINATION_MODE,
     CONTINUOUS_MODE    
+};
+
+enum{
+    NO_ERROR = 0,
+    CRC_ERROR,
+    STX_ERROR,
+    ETX_ERROR,
+    OVERRUN_ERROR
 };
 
 #define NO_QUAD 0
@@ -229,43 +238,43 @@ struct PIDtype
     float TargetVelocity;
     float ActualVelocity[FILTERSIZE];
     short ADCommand;
-    unsigned char saturation;
-    unsigned char reset;    
-    unsigned char Mode;    
-    unsigned char Halted;
-    unsigned char RemoteDataValid;
+    BYTE saturation;
+    BYTE reset;    
+    BYTE Mode;    
+    BYTE Halted;
+    BYTE RemoteDataValid;
 } PID[NUMMOTORS];
 
 
-unsigned char flagRemoteTimeout = false;
-unsigned char DMATxTestFlag = false;
+BYTE flagRemoteTimeout = false;
+BYTE DMATxTestFlag = false;
 unsigned short offSet;
-unsigned char NUMbuffer[MAXNUM + 1];
-unsigned char HOSTRxBuffer[MAXBUFFER+1];
-unsigned char HOSTRxBufferFull = false;
-unsigned char HOSTTxBuffer[MAXBUFFER+1]; 
+BYTE NUMbuffer[MAXNUM + 1];
+BYTE HOSTRxBuffer[MAXBUFFER+1];
+BYTE HOSTRxBufferFull = false;
+BYTE HOSTTxBuffer[MAXBUFFER+1]; 
 
-unsigned char displayFlag = false;
+BYTE displayFlag = false;
 
-unsigned char XBEERxBuffer[MAXBUFFER+1];
-unsigned char XBEEPacket[MAXBUFFER+1];
+BYTE XBEERxBuffer[MAXBUFFER+1];
+BYTE XBEEPacket[MAXBUFFER+1];
 short XBEEData[MAXBUFFER+1];
 float ForwardReverse = 0, RightLeft = 0;
 short XBEEPacketLength;
 
-unsigned char RS485RxBufferFull = false;
-unsigned char RS485TxBufferFull = false;
-unsigned char RS485_DMA_RxBuffer[MAXBUFFER+1];
-unsigned char RS485RxBuffer[MAXBUFFER+1];
-unsigned char RS485TxBuffer[MAXBUFFER+1];
+BYTE RS485RxBufferFull = false;
+BYTE RS485TxBufferFull = false;
+BYTE RS485_DMA_RxBuffer[MAXBUFFER+1];
+BYTE RS485RxBuffer[MAXBUFFER+1];
+BYTE RS485TxBuffer[MAXBUFFER+1];
 int RS485TxIndex = 0;
 int RS485TxLength = 0;
-unsigned char ServoData[MAXBUFFER+1];
+BYTE ServoData[MAXBUFFER+1];
 short servoPositions[MAXSERVOS];
 long ActualRS485BaudRate = 0;
 int timeout = 0;
 
-extern unsigned char CheckCRC (unsigned char *ptrPacketData, short packetLength);
+extern BYTE CheckCRC (BYTE *ptrPacketData, short packetLength);
 
 void ClearCopyBuffer();
 void SetupDMA_Rx(void);
@@ -277,21 +286,21 @@ void YourLowPriorityISRCode();
 void UserInit(void);
 void InitializeUSART(void);
 void putcUSART(char c);
-unsigned char getcUSART();
-extern unsigned char CheckCRC (unsigned char *ptrRxModbus, short RxModbusLength);
-unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData);
-void PrintServoData(short numServos, short *ptrServoPositions, unsigned char command, unsigned char subCommand);
-unsigned char SendReceiveSPI(unsigned char dataOut);
+BYTE getcUSART();
+extern BYTE CheckCRC (BYTE *ptrRxModbus, short RxModbusLength);
+unsigned short decodePacket(BYTE *ptrInPacket, BYTE *ptrData, BYTE *errorCode);
+void PrintServoData(short numServos, short *ptrServoPositions, BYTE command, BYTE subCommand);
+BYTE SendReceiveSPI(BYTE dataOut);
 void ResetPID();
 void InitPID();
 long POTcontrol(long servoID, struct PIDtype *PID);
 long ENCODERcontrol(long servoID, struct PIDtype *PID);
-unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, short *numData, short *ptrData, unsigned char *command, unsigned char *subCommand);
-// short BuildPacket(unsigned char command, unsigned char subcommand, unsigned char numData, short *ptrData, unsigned char *ptrPacket, short *packetLength);
+BYTE processPacketData(short packetLength, BYTE *ptrPacket, short *numData, short *ptrData, BYTE *command, BYTE *subCommand, BYTE *errorCode);
+// short BuildPacket(BYTE command, BYTE subcommand, BYTE numData, short *ptrData, BYTE *ptrPacket, short *packetLength);
 
-unsigned char DATABufferFull = false;
+BYTE DATABufferFull = false;
 // void ClearCopyBuffer();
-void makeFloatString(float InValue, int numDecimalPlaces, unsigned char *arrAscii);
+void makeFloatString(float InValue, int numDecimalPlaces, BYTE *arrAscii);
 
 
 enum
@@ -305,15 +314,15 @@ enum
 };
 
 short time, seconds = 0, minutes = 0, hundredths = 0;
-// unsigned char TestMode = false;
+// BYTE TestMode = false;
 unsigned short ADresult[MAXPOTS];
 unsigned short SWRead = 0;
-unsigned char SWChangeFlag = false;
-unsigned char intFlag = false;
-unsigned char memoryFlag = false;
+BYTE SWChangeFlag = false;
+BYTE intFlag = false;
+BYTE memoryFlag = false;
 
 short errIndex = 0;
-unsigned char startPacket = false;
+BYTE startPacket = false;
 short XBEEtimeout = 0;
 
 #define PCA9685_ADDRESS 0x80 // Basic default address for Adafruit Feather Servo Board
@@ -331,16 +340,15 @@ int main(void)
     #define NUM_RC_SERVOS 5
     short RCservoPos[NUM_RC_SERVOS] = {0,0,0,0,0};
     short PreviousRCservoPos[NUM_RC_SERVOS] = {0,0,0,0,0};
-    unsigned char ch, command, subCommand, outPacket[MAXBUFFER];
+    BYTE ch, temp, command, subCommand, outPacket[MAXBUFFER];
     short numDataIntegers, outData[MAXBUFFER], packetLength;          
     short packetCounter = 0;
     float tempCommand;
     short ServoCommandPosition;
-    unsigned char runMode = REMOTE;
-    unsigned char runState = HALTED;    
+    BYTE runMode = REMOTE;
+    BYTE runState = HALTED;    
     short RCServoID = 0;
-    short testCounter = 0;
-    short displayCounter = 0;
+    BYTE errorCode = NO_ERROR;
     
     InitPID();     
     DelayMs(10);       
@@ -360,7 +368,7 @@ int main(void)
     //MessageIn[numBytes] = '0';
     //printf("\rMessage: %s", MessageIn);
     
-    printf("\r\rSTART TEST #1");
+    printf("\r\rSTART ERROR CODE TEST #1");
     printf("\rHOST Baudrate: %ld", ActualHOSTBaudRate);        
     printf("\rXBEE Baudrate: %ld", ActualXBEEBaudRate);
 
@@ -413,10 +421,11 @@ int main(void)
         
         if (XBEEPacketLength)   // $$$$
         {         
-            if ( processPacketData(XBEEPacketLength, XBEEPacket, &numDataIntegers, XBEEData, &command, &subCommand))
+            if ( processPacketData(XBEEPacketLength, XBEEPacket, &numDataIntegers, XBEEData, &command, &subCommand, &errorCode))
             {
-                timeout = 5000;                                                
-                if (command == 0xB1 && subCommand >= 0)
+                timeout = 5000;                  
+                temp = command & 0xF0;
+                if (temp == 0xB0 && subCommand >= 0)
                 {                    
                     if (subCommand < NUMMOTORS)
                     {
@@ -442,6 +451,7 @@ int main(void)
                     printf("\rREMOTE #%d %02X: Servo #%d: XBEE: %d, COM: %d", packetCounter++, command, subCommand, XBEEData[0], ServoCommandPosition);
                 }
             }
+            else printf("\rPACKET ERROR CODE: %d", errorCode);            
             XBEEPacketLength = 0;
         }        
                     
@@ -735,7 +745,7 @@ int main(void)
 
 
 
-void PrintServoData(short numServos, short *ptrServoPositions, unsigned char command, unsigned char subCommand)
+void PrintServoData(short numServos, short *ptrServoPositions, BYTE command, BYTE subCommand)
 {
     int i;
     printf("\rOK! Com: %d, Sub: %d, servos %d: ", command, subCommand, numServos);
@@ -748,7 +758,7 @@ void PrintServoData(short numServos, short *ptrServoPositions, unsigned char com
 #define BACKSPACE 8
 void __ISR(HOST_VECTOR, IPL2AUTO) IntHostUartHandler(void) 
 {
-unsigned char ch, inByte;
+BYTE ch, inByte;
 static unsigned long i = 0;
 
     if (INTGetFlag(INT_SOURCE_UART_RX(HOSTuart))) 
@@ -831,7 +841,7 @@ void __ISR(_CHANGE_NOTICE_VECTOR, ipl2) ChangeNotice_Handler(void)
 void __ISR(_DMA0_VECTOR, IPL5SOFT) DmaRxHandler(void)
 {
     int i;
-    unsigned char ch;
+    BYTE ch;
 	int	evFlags;				// event flags when getting the interrupt
 
 	INTClearFlag(INT_SOURCE_DMA(DMA_CHANNEL0));	// release the interrupt in the INT controller, we're servicing int
@@ -1099,7 +1109,7 @@ void InitializeSystem(void)
 // RS485 UART interrupt handler it is set at priority level 2
 void __ISR(RS485_VECTOR, ipl2) IntRS485UartHandler(void) 
 {
-    unsigned char ch;
+    BYTE ch;
     static unsigned short RS485RxIndex = 0;
 
     if (INTGetFlag(INT_SOURCE_UART_RX(RS485uart))) 
@@ -1162,7 +1172,7 @@ void __ISR(RS485_VECTOR, ipl2) IntRS485UartHandler(void)
 
 int StartRS485Tx()
 {
-    unsigned char ch;
+    BYTE ch;
     RS485TxLength = strlen(RS485TxBuffer);
     if (RS485TxLength > MAXBUFFER) return 0;    
     RS485_ENABLE = 1;
@@ -1185,13 +1195,16 @@ void ClearCopyBuffer()
 }
 
 
-unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, short *numData, short *ptrData, unsigned char *command, unsigned char *subCommand)
+BYTE processPacketData(short packetLength, BYTE *ptrPacket, short *numData, short *ptrData, BYTE *command, BYTE *subCommand, BYTE *errorCode)
 {
     MConvertType dataValue;    
     short j, i = 0;  
-    unsigned char packetDataLength, packetBytes[MAXBUFFER];
+    BYTE packetDataLength, packetBytes[MAXBUFFER];
     
-    packetDataLength = decodePacket(ptrPacket, packetBytes);    
+    *errorCode = NO_ERROR; // Reset error flag to start with.
+    
+    packetDataLength = decodePacket(ptrPacket, packetBytes, errorCode);    
+    if (packetDataLength == 0) return false;    
     
     i = 0;
     *command = packetBytes[i++];
@@ -1208,16 +1221,20 @@ unsigned char processPacketData(short packetLength, unsigned char *ptrPacket, sh
         dataValue.b[1] = packetBytes[i++];
         ptrData[j++] = dataValue.integer;
     }    
-    if (!CheckCRC(packetBytes, i)) return false; 
+    if (!CheckCRC(packetBytes, i)) 
+    {
+        *errorCode = CRC_ERROR;
+        return false; 
+    }
     return true;
 }
 
-unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData)
+unsigned short decodePacket(BYTE *ptrInPacket, BYTE *ptrData, BYTE *errorCode)
 {
     unsigned short i, j;
-    unsigned char escapeFlag = FALSE;
-    unsigned char startFlag = false;
-    unsigned char ch;
+    BYTE escapeFlag = FALSE;
+    BYTE startFlag = false;
+    BYTE ch;
 
     j = 0;
     for (i = 0; i < MAXBUFFER; i++) 
@@ -1233,7 +1250,11 @@ unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData)
                     startFlag = true;
                     j = 0;
                 }
-                else return (0);
+                else
+                {
+                    *errorCode = STX_ERROR;
+                    return (0);
+                }
             } 
             else if (ch == ETX) 
                 return (j);
@@ -1241,7 +1262,11 @@ unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData)
                 escapeFlag = TRUE;
             else if (j < MAXBUFFER)
                 ptrData[j++] = ch;
-            else return (0);
+            else
+            {
+                *errorCode = OVERRUN_ERROR;
+                return (0);
+            }
         } 
         // Escape flag active
         else 
@@ -1250,10 +1275,18 @@ unsigned short decodePacket(unsigned char *ptrInPacket, unsigned char *ptrData)
             if (ch == ETX-1) ch = ETX;            
             if (j < MAXBUFFER)
                 ptrData[j++] = ch;
-            else return(0);
+            else
+            {
+                *errorCode = OVERRUN_ERROR;
+                return(0);
+            }
         }
     }
-    return (j);
+    
+    if (i >= MAXBUFFER) *errorCode = OVERRUN_ERROR;
+    else if (!startFlag) *errorCode = STX_ERROR;
+    else *errorCode = ETX_ERROR;
+    return (0);
 }
 
 // Timer 2 generates an interrupt every 50 microseconds approximately
@@ -1448,7 +1481,7 @@ long ENCODERcontrol(long servoID, struct PIDtype *PID)
     long Error;         
     long lngCommandPos = 0;    
     float PCorr = 0, ICorr = 0, DCorr = 0;    
-    unsigned char EncoderDirection;
+    BYTE EncoderDirection;
     static short displayCounter = 0;
     short i;    
     float ActualVelocity, AverageVelocity, ErrorVelocity;
@@ -1724,7 +1757,7 @@ long POTcontrol(long servoID, struct PIDtype *PID)
 // XBEE UART interrupt handler it is set at priority level 2
 void __ISR(XBEE_VECTOR, ipl2) IntXBEEUartHandler(void) 
 {
-    unsigned char ch;
+    BYTE ch;
     static short XBEERxIndex = 0;    
     short i;
     
