@@ -1,5 +1,5 @@
 /**********************************************************************************
- * PROJECT: PIC795 MD13S CONTROLLER
+ * PROJECT: PIC795 MD13S CONTROLLER - STORED ON GIHUB AS PIC795_CytronMD13S_PWM
  * main.c
  * 
  * Compiled for PIC32MX795 XC32 compiler version 1.30 
@@ -40,6 +40,8 @@
  *              RCservoPos[i] = (short)(ADresult[i+6]/4) + 22;
  * 12-20-20:    XBEE baud rate didn't work well at 115200. Set back to 57600.
  * 12-27-20:    Added errorCode to detect transmission errors on incoming data.
+ * 12-31-20:    No big changes at this point. Works beautifully with MIDI_Device
+ *              running in either RS232 or USB mode.
  ***********************************************************************************/
 
 enum {
